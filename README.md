@@ -1,8 +1,12 @@
-# AVA-VLA
+# 🤖 AVA-VLA: Think Less, Act Early
 
-Official code release for **AVA-VLA: Think Less, Act Early - Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models**.
+### ⚡ Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models
 
-AVA-VLA extends Vision-Language-Action models with latent reasoning, reinforcement-learning-based denoising, and adaptive early exit. The goal is to reduce unnecessary reasoning steps while preserving robust robotic control behavior.
+✨ **AVA-VLA** extends Vision-Language-Action models with latent reasoning, reinforcement-learning-based denoising, and adaptive early exit.
+
+🎯 The goal is to reduce unnecessary reasoning steps while preserving robust robotic control behavior.
+
+![AVA-VLA overview](assets/avavla_overview.png)
 
 ## 🔑 Highlights
 
