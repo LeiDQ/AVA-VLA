@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use AVA-VLA, please cite the paper and this code release."
+title: "Think Less, Act Early: Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models"
+version: "v1.0.0"
+type: software
+repository-code: "https://github.com/EDGSCOUT/AVA-VLA"
+url: "https://github.com/EDGSCOUT/AVA-VLA"
+abstract: "ICML 2026 accepted code release."
+authors:
+  - family-names: "Lei"
+    given-names: "Dianqiao"
+    affiliation: "Tsinghua University"
+    email: "leidq23@mails.tsinghua.edu.cn"
+  - family-names: "Shan"
+    given-names: "Lianlei"
+    affiliation: "Tsinghua University"
+preferred-citation:
+  type: conference-paper
+  title: "Think Less, Act Early: Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models"
+  conference: "International Conference on Machine Learning (ICML)"
+  year: 2026
+  authors:
+    - family-names: "Lei"
+      given-names: "Dianqiao"
+      affiliation: "Tsinghua University"
+      email: "leidq23@mails.tsinghua.edu.cn"
+    - family-names: "Shan"
+      given-names: "Lianlei"
+      affiliation: "Tsinghua University"

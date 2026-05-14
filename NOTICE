@@ -1,0 +1,27 @@
+AVA-VLA Notice
+==============
+
+This repository contains the AVA-VLA code release for:
+
+  Think Less, Act Early: Reinforced Latent Reasoning with Early Exit in
+  Vision-Language-Action Models
+
+AVA-VLA-specific contributions are copyright (c) 2026 Dianqiao Lei,
+Lianlei Shan, Tsinghua University.
+
+This repository also includes code adapted from or derived from upstream
+Vision-Language-Action model infrastructure, including OpenVLA-OFT, OpenVLA,
+and Prismatic components. The upstream code portions retain their original
+copyright and license notices.
+
+The original LICENSE file in this repository preserves the upstream MIT
+License notice:
+
+  Copyright (c) 2025 Moo Jin Kim, Chelsea Finn, Percy Liang.
+
+Additional third-party projects used by the training and evaluation workflows
+include LIBERO, ALOHA, Hugging Face Transformers/Hub, PyTorch, TensorFlow,
+TensorFlow Datasets, RLDS-related tooling, PEFT, Diffusers, and related robot
+learning dependencies. Those projects are governed by their own licenses.
+
+No AVA-VLA checkpoints are published as part of the v1.0.0 source release.
