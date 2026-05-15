@@ -73,9 +73,9 @@ sagemaker = [
 ]
 
 [project.urls]
-homepage = "https://github.com/EDGSCOUT/AVA-VLA"
-repository = "https://github.com/EDGSCOUT/AVA-VLA"
-documentation = "https://github.com/EDGSCOUT/AVA-VLA"
+homepage = "https://github.com/LeiDQ/AVA-VLA"
+repository = "https://github.com/LeiDQ/AVA-VLA"
+documentation = "https://github.com/LeiDQ/AVA-VLA"
 
 [tool.setuptools.packages.find]
 where = ["."]

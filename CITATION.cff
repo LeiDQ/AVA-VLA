@@ -3,8 +3,8 @@ message: "If you use AVA-VLA, please cite the paper and this code release."
 title: "Think Less, Act Early: Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models"
 version: "v1.0.0"
 type: software
-repository-code: "https://github.com/EDGSCOUT/AVA-VLA"
-url: "https://github.com/EDGSCOUT/AVA-VLA"
+repository-code: "https://github.com/LeiDQ/AVA-VLA"
+url: "https://github.com/LeiDQ/AVA-VLA"
 abstract: "ICML 2026 accepted code release."
 authors:
   - family-names: "Lei"

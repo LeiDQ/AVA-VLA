@@ -113,7 +113,7 @@ conda activate avavla-aloha
 pip3 install torch torchvision torchaudio
 
 # Clone AVA-VLA repo and install dependencies
-git clone https://github.com/EDGSCOUT/AVA-VLA.git
+git clone https://github.com/LeiDQ/AVA-VLA.git
 cd AVA-VLA
 pip install -e .
 

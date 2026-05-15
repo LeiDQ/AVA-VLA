@@ -86,9 +86,11 @@ export RUN_ROOT=/path/to/runs
 export CHECKPOINT_DIR=/path/to/checkpoints
 ```
 
-## ✅ Quick Verification
+## ✅ Environment and Code Sanity Checks
 
-Run the lightweight AVA-VLA tests after installing dependencies:
+These checks do not require released AVA-VLA checkpoints. They verify that the package, core modules, and command-line entrypoints are available after dependency installation.
+
+Run the lightweight AVA-VLA tests:
 
 ```bash
 python scripts/test_avavla_simple.py
