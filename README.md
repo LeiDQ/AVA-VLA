@@ -1,10 +1,10 @@
 # AVA-VLA
 
-Official implementation and reproduction toolkit for **AVA-VLA: Think Less, Act Early**.
+Official implementation of **AVA-VLA: Think Less, Act Early**.
 
 [Paper](https://arxiv.org/abs/2606.15099) · [Detailed implementation notes](IMPLEMENTATION_REPRODUCTION_NOTES.md) · [LIBERO setup](LIBERO.md) · [General setup](SETUP.md)
 
-AVA-VLA adds reinforced latent reasoning and dynamic early exit to an OpenVLA/OpenVLA-OFT policy. This repository provides the four-stage training pipeline, distributed online rollouts, checkpoint recovery, benchmark evaluation, and result aggregation used for the main experiments.
+AVA-VLA adds reinforced latent reasoning and dynamic early exit to an OpenVLA/OpenVLA-OFT policy. This repository provides the four-stage training pipeline, distributed online rollouts, checkpoint recovery, benchmark evaluation, and result aggregation.
 
 ## Installation
 
@@ -52,7 +52,7 @@ models/
 │   ├── config.json
 │   ├── dataset_statistics.json
 │   └── checkpoints/step-295000-epoch-40-loss=0.2200.pt
-├── openvla-7b-dinosiglip-384-prismatic/  # optional paper-resolution base
+├── openvla-7b-dinosiglip-384-prismatic/  # optional 384px base
 │   ├── BASE_VERIFIED.json
 │   ├── config.json
 │   ├── dataset_statistics.json
@@ -76,7 +76,7 @@ The training launchers expect an OpenVLA/OXE robot-pretrained base with a DINOv2
 ### Optional 384px vision encoder
 
 The default launcher profile remains `openvla-224`, so existing runs continue to use the verified
-`prism-dinosiglip-224px+7b` base. To use the paper-resolution visual encoder, select
+`prism-dinosiglip-224px+7b` base. To use the 384px visual encoder, select
 `VISION_BACKBONE_PROFILE=dinosiglip-384`. This profile uses the fused
 `DINOv2 + SigLIP-SO/14 @ 384px` backbone registered as `dinosiglip-vit-so-384px` and enables the
 runtime `--require_384px_backbone true` guard.
@@ -93,7 +93,7 @@ Validate a candidate before allocating GPUs:
   --expected-resolution 384 --full-hash
 ```
 
-Run one-policy-per-suite reproduction with 384px input:
+Run per-suite training with 384px input:
 
 ```bash
 mkdir -p logs/paper_reproduction_dinosiglip384
@@ -141,7 +141,7 @@ AVA-VLA training consists of four consecutive stages:
 3. Joint online PPO with benchmark task rewards.
 4. Exit-gate calibration.
 
-The main experiment configuration is:
+The default full training configuration is:
 
 | Setting | Value |
 |---|---:|
@@ -176,7 +176,7 @@ The installed reference robot base is `prism-dinosiglip-224px+7b`; the optional
 `dinosiglip-384` profile selects `prism-dinosiglip+7b` from a separate compatible robot base.
 Training, online rollout, and deterministic evaluation derive image resolution and transforms from the selected checkpoint and share the same proprioception statistics, action normalization, action chunking, and history convention.
 
-## Reproducing Table 1
+## LIBERO training and evaluation
 
 ### One policy per suite
 
@@ -226,7 +226,7 @@ nohup env \
 
 For each seed, the launcher trains one checkpoint and evaluates it on all four suites. The aggregation step verifies checkpoint identity across the four result sets.
 
-### Table 1 aggregation
+### Result aggregation
 
 The launchers aggregate results automatically after all requested runs finish. Existing evaluation files can also be aggregated directly:
 
@@ -244,7 +244,7 @@ The launchers aggregate results automatically after all requested runs finish. E
   --output results/paper_all_suites/table1_ours_all_policy.json
 ```
 
-## Reproducing Table 3: CALVIN ABC→D
+## CALVIN training and evaluation
 
 The native CALVIN adapter streams `episode_XXXXXXX.npz` files and language annotations directly. It constructs 9-frame observation histories, 8-step relative-action targets, static/wrist RGB inputs, and AVA-VLA proprioception features. Dataset statistics are cached in `avavla_calvin_statistics.json` after the first scan.
 
@@ -286,13 +286,13 @@ bash scripts/run_official_base_preflight.sh \
   models/openvla-7b-modelscope-prismatic
 ```
 
-Run the Table 1 all-suite integration test with 200 BC steps, 50 warmup steps, one 4,096-environment-step PPO update, and 20 exit-calibration steps:
+Run the all-suite integration test with 200 BC steps, 50 warmup steps, one 4,096-environment-step PPO update, and 20 exit-calibration steps:
 
 ```bash
 bash scripts/run_table1_all_suites_short.sh
 ```
 
-These tests validate execution, distributed communication, online environment interaction, metrics, and checkpoint structure. Reproduction results should be reported only from the full training and evaluation budgets above.
+These tests validate execution, distributed communication, online environment interaction, metrics, and checkpoint structure. Benchmark results should be reported only from the full training and evaluation budgets above.
 
 ## Monitoring and outputs
 
@@ -344,7 +344,7 @@ LIBERO evaluation uses 10 tasks, 50 trials per task, center crop, proprioception
 
 Each resumable checkpoint contains a `CHECKPOINT_COMPLETE.json` manifest. The manifest records all required components and their byte sizes so interrupted or partially copied checkpoints are not resumed as complete runs.
 
-BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The paper launchers validate and resume compatible checkpoints automatically. `SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
+BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The training launchers validate and resume compatible checkpoints automatically. `SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
 
 For a manual distributed resume, keep all experiment arguments identical to the original run:
 
@@ -367,7 +367,7 @@ experiments/robot/libero/online_rollout.py   LIBERO online collectors
 experiments/robot/calvin/dataset.py          CALVIN dataset adapter
 experiments/robot/calvin/online_rollout.py   CALVIN online collector
 experiments/robot/calvin/run_calvin_eval.py  CALVIN sequence evaluation
-scripts/aggregate_table1_ours.py             Table 1 aggregation
+scripts/aggregate_table1_ours.py             LIBERO result aggregation
 ```
 
 Architecture details, PPO data flow, normalization contracts, checkpoint schema, and extended debugging instructions are documented in [IMPLEMENTATION_REPRODUCTION_NOTES.md](IMPLEMENTATION_REPRODUCTION_NOTES.md).
