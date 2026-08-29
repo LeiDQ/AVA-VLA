@@ -43,9 +43,10 @@ def test_core_components() -> bool:
     exit_score = exit_gate(z_next)
     value = value_fn(z_next)
 
-    assert policy_output["logits"].shape == (batch_size, update_dim)
-    assert policy_output["probs"].shape == (batch_size, update_dim)
-    assert torch.allclose(policy_output["probs"].sum(dim=-1), torch.ones(batch_size), atol=1e-5)
+    assert policy_output["mean"].shape == (batch_size, update_dim)
+    assert policy_output["log_std"].shape == (batch_size, update_dim)
+    assert policy_output["std"].shape == (batch_size, update_dim)
+    assert (policy_output["std"] > 0).all()
     assert update_action.shape == (batch_size, update_dim)
     assert log_prob.shape == (batch_size,)
     assert entropy.shape == (batch_size,)
@@ -53,7 +54,7 @@ def test_core_components() -> bool:
     assert exit_score.shape == (batch_size, 1)
     assert value.shape == (batch_size, 1)
     assert torch.isfinite(z_next).all()
-    print("PASS: Softmax policy, GRU transition, exit gate, and value function are shape-valid.")
+    print("PASS: Gaussian policy, GRU transition, exit gate, and value function are shape-valid.")
     return True
 
 
@@ -76,7 +77,7 @@ def test_policy_ratio_updates() -> bool:
         update_action = update_action.detach()
         old_log_prob = old_log_prob.detach()
 
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-2)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2, betas=(0.9, 0.999), eps=1e-8)
     for _ in range(3):
         output = policy(z_t, o_t)
         log_prob, _ = policy.evaluate_update_action(output, update_action)

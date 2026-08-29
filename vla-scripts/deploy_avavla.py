@@ -4,6 +4,8 @@ deploy_avavla.py
 Deploy AVA-VLA for inference with latent reasoning and early-exit.
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Dict, Optional
@@ -27,6 +29,10 @@ from prismatic.vla.constants import (
     STOP_INDEX,
     NormalizationType,
 )
+from prismatic.vla.preprocessing import center_crop_for_augmentation
+
+MIN_SAFE_IMPLEMENTATION_VERSION = 9
+
 
 
 def _checkpoint_sort_key(path: Path) -> tuple[int, object]:
@@ -42,6 +48,22 @@ def _checkpoint_sort_key(path: Path) -> tuple[int, object]:
 
 def _find_component_checkpoint(checkpoint_path: Path, stem: str) -> Optional[Path]:
     """Find latest or step-specific component checkpoint in a checkpoint directory."""
+    manifest_path = checkpoint_path / "CHECKPOINT_COMPLETE.json"
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            matches = [
+                checkpoint_path / relative_name
+                for relative_name in manifest.get("required_files", {})
+                if Path(relative_name).name.startswith(f"{stem}--")
+            ]
+            if len(matches) == 1 and matches[0].is_file():
+                return matches[0]
+        except (OSError, TypeError, json.JSONDecodeError):
+            pass
+
+
     latest = checkpoint_path / f"{stem}--latest_checkpoint.pt"
     if latest.exists():
         return latest
@@ -49,14 +71,48 @@ def _find_component_checkpoint(checkpoint_path: Path, stem: str) -> Optional[Pat
     candidates = sorted(checkpoint_path.glob(f"{stem}--*_checkpoint.pt"), key=_checkpoint_sort_key)
     return candidates[-1] if candidates else None
 
+def _validate_checkpoint_manifest(checkpoint_path: Path) -> Dict:
+    """Require an atomically published, post-fix AVA checkpoint."""
+    manifest_path = checkpoint_path / "CHECKPOINT_COMPLETE.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"Missing complete-checkpoint manifest: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    version = int(manifest.get("implementation_version", 0))
+    if version < MIN_SAFE_IMPLEMENTATION_VERSION:
+        raise RuntimeError(
+            f"Unsafe AVA checkpoint implementation_version={version}; "
+            "the manifest is incompatible with the current action-PPO and inference contract."
+        )
+    required_files = manifest.get("required_files")
+    if not isinstance(required_files, dict) or not required_files:
+        raise RuntimeError(f"Checkpoint manifest has no required_files map: {manifest_path}")
+    for relative_name, expected_size in required_files.items():
+        artifact = checkpoint_path / relative_name
+        actual_size = artifact.stat().st_size if artifact.is_file() else -1
+        if actual_size <= 0 or actual_size != int(expected_size):
+            raise RuntimeError(
+                f"Incomplete checkpoint artifact {artifact}: size={actual_size}, expected={expected_size}"
+            )
+    return manifest
+
+
 
 def _load_avavla_config(checkpoint_path: Path) -> Dict:
     """Load AVA-VLA hyperparameters saved by finetune_avavla.py."""
+    _validate_checkpoint_manifest(checkpoint_path)
     config_path = checkpoint_path / "avavla_config.json"
-    if not config_path.exists():
-        return {}
-    with open(config_path, "r") as f:
-        return json.load(f)
+    if not config_path.is_file():
+        raise RuntimeError(f"Missing AVA-VLA config: {config_path}")
+    with config_path.open("r", encoding="utf-8") as stream:
+        config = json.load(stream)
+    version = int(config.get("implementation_version", 0))
+    if version < MIN_SAFE_IMPLEMENTATION_VERSION:
+        raise RuntimeError(
+            f"Unsafe AVA config implementation_version={version}; "
+            "refusing components that do not satisfy the current checkpoint schema."
+        )
+    return config
 
 
 def _unnormalize_actions(model: AVAVLA, normalized_actions: np.ndarray, unnorm_key: Optional[str]) -> np.ndarray:
@@ -102,16 +158,14 @@ def load_avavla_model(
     checkpoint_path = Path(checkpoint_path)
     avavla_cfg = _load_avavla_config(checkpoint_path)
     max_reasoning_steps = max_reasoning_steps if max_reasoning_steps is not None else avavla_cfg.get("max_reasoning_steps", 5)
-    exit_threshold = exit_threshold if exit_threshold is not None else avavla_cfg.get("exit_threshold", 0.8)
+    exit_threshold = exit_threshold if exit_threshold is not None else avavla_cfg.get("exit_threshold", 0.55)
 
     # Load normalization statistics
     norm_stats_path = checkpoint_path / "dataset_statistics.json"
-    if norm_stats_path.exists():
-        with open(norm_stats_path, "r") as f:
-            norm_stats = json.load(f)
-    else:
-        norm_stats = {}
-        print(f"Warning: No normalization statistics found at {norm_stats_path}")
+    if not norm_stats_path.is_file():
+        raise RuntimeError(f"Missing required normalization statistics: {norm_stats_path}")
+    with norm_stats_path.open("r", encoding="utf-8") as stream:
+        norm_stats = json.load(stream)
     
     config_path = checkpoint_path / "config.json"
     if not config_path.exists():
@@ -139,6 +193,24 @@ def load_avavla_model(
     else:
         raise ValueError(f"Unsupported config.json format in {config_path}")
 
+    if not enable_latent_reasoning:
+        raise RuntimeError("Formal AVA-VLA evaluation requires latent reasoning to be enabled.")
+    vla_metadata = config_json.get("vla", {})
+    metadata_text = json.dumps(vla_metadata, sort_keys=True).lower()
+    robot_pretrained = bool(
+        "openvla" in model_id.lower()
+        or (
+            str(config_json.get("stage", "")).lower() == "vla-full-train"
+            and "oxe" in metadata_text
+        )
+    )
+    if avavla_cfg.get("require_robot_pretrained_base", True) and not robot_pretrained:
+        raise RuntimeError(
+            f"Checkpoint model_id={model_id!r} is not the required robot-pretrained OpenVLA base; "
+            "refusing evaluation of a generic Prism/LLaVA initialization."
+        )
+
+
     checkpoint_file = checkpoint_path / "checkpoints" / "latest-checkpoint.pt"
     if not checkpoint_file.exists():
         checkpoint_candidates = sorted((checkpoint_path / "checkpoints").glob("*.pt")) if (checkpoint_path / "checkpoints").exists() else []
@@ -147,11 +219,18 @@ def load_avavla_model(
         else:
             raise FileNotFoundError(f"Could not find a Prismatic checkpoint under {checkpoint_path / 'checkpoints'}")
 
-    vision_backbone, _ = get_vision_backbone_and_transform(vision_backbone_id, image_resize_strategy)
+    tokenizer_path = Path(__file__).resolve().parents[1] / "models" / "llama2-7b-ms-tokenizer"
+    if not tokenizer_path.is_dir():
+        raise FileNotFoundError(f"Missing local Llama config/tokenizer directory: {tokenizer_path}")
+    vision_backbone, _ = get_vision_backbone_and_transform(
+        vision_backbone_id, image_resize_strategy, initialize_empty=True
+    )
     llm_backbone, tokenizer = get_llm_backbone_and_tokenizer(
         llm_backbone_id,
         llm_max_length=llm_max_length,
         inference_mode=True,
+        initialize_empty=True,
+        config_and_tokenizer_path=str(tokenizer_path),
     )
     action_tokenizer = ActionTokenizer(tokenizer)
 
@@ -166,55 +245,54 @@ def load_avavla_model(
         action_tokenizer=action_tokenizer,
         latent_dim=avavla_cfg.get("latent_dim", 512),
         obs_dim=avavla_cfg.get("obs_dim", 768),
-        reasoning_hidden_dim=avavla_cfg.get("reasoning_hidden_dim", 1024),
+        proprio_dim=avavla_cfg.get("proprio_dim", 8),
+        reasoning_hidden_dim=avavla_cfg.get("reasoning_hidden_dim", 512),
+        reasoning_num_heads=avavla_cfg.get("reasoning_num_heads", 8),
+        reasoning_num_layers=avavla_cfg.get("reasoning_num_layers", 4),
         transition_hidden_dim=avavla_cfg.get("transition_hidden_dim", 1024),
         exit_gate_hidden_dim=avavla_cfg.get("exit_gate_hidden_dim", 256),
         value_hidden_dim=avavla_cfg.get("value_hidden_dim", 512),
         update_dim=avavla_cfg.get("update_dim", 64),
-        reasoning_policy_type=avavla_cfg.get("reasoning_policy_type", "softmax"),
+        dropout=avavla_cfg.get("dropout", 0.1),
+        reasoning_policy_type=avavla_cfg.get("reasoning_policy_type", "gaussian"),
         max_reasoning_steps=max_reasoning_steps,
         exit_threshold=exit_threshold,
         enable_latent_reasoning=enable_latent_reasoning,
     )
 
-    # Load AVA-VLA specific components. Prefer the compact full AVA state; fall back to legacy per-module files.
+    image_resolution = tuple(int(x) for x in model.vision_backbone.default_image_resolution[-2:])
+    if avavla_cfg.get("require_dinosiglip_backbone", True) and not vision_backbone_id.startswith("dinosiglip-"):
+        raise RuntimeError(
+            f"Formal AVA-VLA evaluation requires DINOv2+SigLIP; got {vision_backbone_id}."
+        )
+    if avavla_cfg.get("require_384px_backbone", False) and image_resolution != (384, 384):
+        raise RuntimeError(
+            f"Formal AVA-VLA evaluation requires a 384px DINOv2+SigLIP backbone; got {image_resolution}."
+        )
+
+    # A formal checkpoint must contain the complete AVA state. Partial legacy
+    # module sets silently leave newly added projections random and are unsafe.
     avavla_state_path = _find_component_checkpoint(checkpoint_path, "avavla")
-    if avavla_state_path is not None:
-        print(f"Loading AVA-VLA components from {avavla_state_path}")
-        model.load_avavla_state_dict(torch.load(avavla_state_path, map_location=device), strict=True)
-    else:
-        avavla_components = [
-            "reasoning_policy",
-            "latent_transition",
-            "exit_gate",
-            "value_function",
-        ]
+    if avavla_state_path is None:
+        raise RuntimeError(f"Missing complete AVA-VLA state under {checkpoint_path}")
+    print(f"Loading AVA-VLA components from {avavla_state_path}")
+    model.load_avavla_state_dict(torch.load(avavla_state_path, map_location=device), strict=True)
 
-        for component_name in avavla_components:
-            component_path = _find_component_checkpoint(checkpoint_path, component_name)
-            if component_path is not None:
-                print(f"Loading {component_name} from {component_path}")
-                state_dict = torch.load(component_path, map_location=device)
-                getattr(model, component_name).load_state_dict(state_dict)
-            else:
-                print(f"Warning: {component_name} checkpoint not found, using random initialization")
-
-    action_head = None
     action_head_path = _find_component_checkpoint(checkpoint_path, "action_head")
-    if avavla_cfg.get("use_l1_regression", False) or action_head_path is not None:
-        if action_head_path is not None:
-            action_head = L1RegressionActionHead(
-                input_dim=model.llm_dim,
-                hidden_dim=model.llm_dim,
-                action_dim=ACTION_DIM,
-            )
-            action_head.load_state_dict(torch.load(action_head_path, map_location=device))
-            action_head = action_head.to(device)
-            action_head.eval()
-            model.action_head = action_head
-            print(f"Loading action_head from {action_head_path}")
-        else:
-            print("Warning: AVA config expects L1 action head but no action_head checkpoint was found")
+    if not avavla_cfg.get("use_l1_regression", False):
+        raise RuntimeError("Formal AVA-VLA evaluation requires the OpenVLA-OFT L1 action head.")
+    if action_head_path is None:
+        raise RuntimeError(f"Missing required L1 action-head checkpoint under {checkpoint_path}")
+    action_head = L1RegressionActionHead(
+        input_dim=model.llm_dim,
+        hidden_dim=avavla_cfg.get("action_hidden_dim", 2048),
+        action_dim=ACTION_DIM,
+    )
+    action_head.load_state_dict(torch.load(action_head_path, map_location=device), strict=True)
+    action_head = action_head.to(device)
+    action_head.eval()
+    model.action_head = action_head
+    print(f"Loading action_head from {action_head_path}")
     
     # Move to device and set to eval mode
     model = model.to(device)
@@ -233,11 +311,14 @@ def predict_action(
     processor,
     image: Image,
     instruction: str,
+    wrist_image: Optional[Image] = None,
+    proprio: Optional[np.ndarray] = None,
     unnorm_key: Optional[str] = None,
     num_reasoning_steps: Optional[int] = None,
     device: str = "cuda",
     history_states: Optional[torch.Tensor] = None,
     update_history: bool = True,
+    center_crop: bool = False,
 ) -> tuple:
     """
     Predict action using AVA-VLA.
@@ -261,22 +342,28 @@ def predict_action(
             model=model,
             action_head=action_head,
             image=image,
+            wrist_image=wrist_image,
+            proprio=proprio,
             instruction=instruction,
             unnorm_key=unnorm_key,
             num_reasoning_steps=num_reasoning_steps,
             history_states=history_states,
             update_history=update_history,
+            center_crop=center_crop,
         )
 
     with torch.no_grad():
         actions, reasoning_info = model.predict_action(
             image=image,
             instruction=instruction,
+            wrist_image=wrist_image,
+            proprio=proprio,
             unnorm_key=unnorm_key,
             num_reasoning_steps=num_reasoning_steps,
             return_reasoning_info=True,
             history_states=history_states,
             update_history=update_history,
+            center_crop=center_crop,
         )
 
     return actions, reasoning_info
@@ -288,13 +375,20 @@ def _predict_action_with_l1_head(
     action_head: L1RegressionActionHead,
     image: Image,
     instruction: str,
+    wrist_image: Optional[Image] = None,
+    proprio: Optional[np.ndarray] = None,
     unnorm_key: Optional[str] = None,
     num_reasoning_steps: Optional[int] = None,
     history_states: Optional[torch.Tensor] = None,
     update_history: bool = True,
+    center_crop: bool = False,
 ) -> tuple:
     """Predict continuous actions through the same L1 action head used during fine-tuning."""
     image_transform, tokenizer = model.vision_backbone.image_transform, model.llm_backbone.tokenizer
+    if center_crop:
+        image = center_crop_for_augmentation(image)
+        if wrist_image is not None:
+            wrist_image = center_crop_for_augmentation(wrist_image)
 
     prompt_builder = model.get_prompt_builder()
     prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
@@ -340,29 +434,65 @@ def _predict_action_with_l1_head(
     else:
         raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
-    if model.enable_latent_reasoning:
-        history_states = model._resolve_history_state(history_states, prompt_input_ids.shape[0], prompt_input_ids.device)
-        obs_encoding = model.encode_observation(
-            pixel_values,
-            prompt_input_ids,
-            attention_mask=prompt_attention_mask,
-            history_states=history_states,
-        )
-        z_0 = model.initial_latent_proj(obs_encoding)
-        final_z, exit_scores, reasoning_info = model.latent_reasoning_forward(
-            z_0,
-            obs_encoding,
-            num_steps=num_reasoning_steps,
-            training=False,
-            return_trajectory=False,
-        )
-    else:
-        final_z = None
-        exit_scores = prompt_input_ids.new_zeros(prompt_input_ids.shape[0], 0, dtype=torch.float32)
-        reasoning_info = {"num_steps_performed": 0}
+    pixel_values_wrist = None
+    if wrist_image is not None:
+        pixel_values_wrist = image_transform(wrist_image)
+        if isinstance(pixel_values_wrist, torch.Tensor):
+            pixel_values_wrist = pixel_values_wrist[None, ...].to(model.device)
+        elif isinstance(pixel_values_wrist, dict):
+            pixel_values_wrist = {
+                key: value[None, ...].to(model.device) for key, value in pixel_values_wrist.items()
+            }
+        else:
+            raise ValueError(f"Unsupported wrist pixel type = {type(pixel_values_wrist)}")
+    proprio_tensor = None
+    if proprio is not None:
+        normalized_proprio = model.normalize_proprio(proprio, unnorm_key)
+        proprio_tensor = torch.as_tensor(normalized_proprio, device=model.device).reshape(1, -1)
 
     autocast_enabled = model.device.type == "cuda"
     with torch.autocast("cuda", dtype=model.llm_backbone.half_precision_dtype, enabled=autocast_enabled):
+        if model.enable_latent_reasoning:
+            history_states = model._resolve_history_state(
+                history_states,
+                prompt_input_ids.shape[0],
+                prompt_input_ids.device,
+            )
+            obs_encoding, observation_features = model.encode_observation(
+                pixel_values,
+                prompt_input_ids,
+                attention_mask=prompt_attention_mask,
+                history_states=history_states,
+                pixel_values_wrist=pixel_values_wrist,
+                proprio=proprio_tensor,
+                return_features=True,
+            )
+            z_0 = model.initial_latent_proj(obs_encoding)
+            history_free_features = dict(observation_features)
+            history_free_features["history"] = torch.zeros_like(
+                observation_features["history"]
+            )
+            next_history_state = model.initial_latent_proj(
+                model.fuse_observation_features(history_free_features)
+            )
+            final_z, exit_scores, reasoning_info = model.latent_reasoning_forward(
+                z_0,
+                obs_encoding,
+                num_steps=num_reasoning_steps,
+                training=False,
+                return_trajectory=False,
+                force_fixed_steps=num_reasoning_steps is not None,
+            )
+        else:
+            final_z = None
+            next_history_state = None
+            exit_scores = prompt_input_ids.new_zeros(
+                prompt_input_ids.shape[0],
+                0,
+                dtype=torch.float32,
+            )
+            reasoning_info = {"num_steps_performed": 0}
+
         output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -387,11 +517,12 @@ def _predict_action_with_l1_head(
     actions = _unnormalize_actions(model, normalized_actions, unnorm_key)
 
     reasoning_info["exit_threshold"] = model.exit_threshold
-    reasoning_info["exit_scores_history"] = exit_scores.detach().cpu().numpy()
+    # Audit-only fix: NumPy cannot materialize torch.bfloat16 tensors.
+    reasoning_info["exit_scores_history"] = exit_scores.detach().float().cpu().numpy()
     if "num_steps_per_sample" in reasoning_info and torch.is_tensor(reasoning_info["num_steps_per_sample"]):
         reasoning_info["num_steps_per_sample"] = reasoning_info["num_steps_per_sample"].detach().cpu().numpy()
-    if update_history and final_z is not None:
-        model._cached_history_state = final_z.detach()
+    if update_history and next_history_state is not None:
+        model._cached_history_state = next_history_state.detach()
     return actions, reasoning_info
 
 

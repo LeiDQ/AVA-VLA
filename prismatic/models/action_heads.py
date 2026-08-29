@@ -106,6 +106,15 @@ class L1RegressionActionHead(nn.Module):
         action = self.model(rearranged_actions_hidden_states)
         return action
 
+    def forward(self, actions_hidden_states):
+        """DDP-safe action prediction path.
+
+        Training must call the wrapped module itself instead of reaching through
+        ``DistributedDataParallel.module``; otherwise gradients are never reduced
+        across ranks.
+        """
+        return self.predict_action(actions_hidden_states)
+
 
 class NoisePredictionModel(nn.Module):
     """

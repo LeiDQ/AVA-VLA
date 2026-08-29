@@ -109,30 +109,35 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = False,
+        initialize_empty: bool = False,
+        config_and_tokenizer_path: Optional[str] = None,
     ) -> None:
         super().__init__(llm_backbone_id)
         self.llm_family = llm_family
         self.llm_max_length = llm_max_length
         self.inference_mode = inference_mode
+        model_source = config_and_tokenizer_path or hf_hub_path
 
         # Initialize LLM (downloading from HF Hub if necessary) --> `llm_cls` is the actual {Model}ForCausalLM class!
         #   => Note: We're eschewing use of the AutoModel API so that we can be more explicit about LLM-specific details
-        if not self.inference_mode:
+        if not initialize_empty:
             overwatch.info(f"Loading [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
             self.llm = llm_cls.from_pretrained(
                 hf_hub_path,
                 token=hf_token,
-                use_flash_attention_2=use_flash_attention_2 if not self.inference_mode else False,
+                use_flash_attention_2=use_flash_attention_2 if not inference_mode else False,
                 # The following parameters are set to prevent `UserWarnings` from HF; we want greedy decoding!
                 do_sample=False,
                 temperature=1.0,
                 top_p=1.0,
             )
 
-        # [Contract] `inference_mode` means we're loading from a pretrained checkpoint; no need to load base weights!
         else:
-            overwatch.info(f"Building empty [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
-            llm_config = AutoConfig.from_pretrained(hf_hub_path, token=hf_token)
+            overwatch.info(f"Building empty [bold]{llm_family}[/] LLM from [underline]`{model_source}`[/]", ctx_level=1)
+            llm_config = AutoConfig.from_pretrained(model_source, token=hf_token)
+            if llm_family == "llama2":
+                # The OpenVLA-OFT Transformers fork implements parallel bidirectional decoding in SDPA.
+                llm_config._attn_implementation = "sdpa"
             self.llm = llm_cls._from_config(llm_config)
 
         # Lightweight Handling (with extended explanation) for setting some LLM Parameters
@@ -150,7 +155,7 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         # Load (Fast) Tokenizer
         overwatch.info(f"Loading [bold]{llm_family}[/] (Fast) Tokenizer via the AutoTokenizer API", ctx_level=1)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            hf_hub_path, model_max_length=self.llm_max_length, token=hf_token, padding_side="right"
+            model_source, model_max_length=self.llm_max_length, token=hf_token, padding_side="right"
         )
 
         # Validation =>> Our VLM logic currently operates under the assumption that the tokenization of a new input

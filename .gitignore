@@ -145,12 +145,35 @@ dmypy.json
 .DS_Store
 
 # Caches and Datasets
-cache/
-data/
+/cache/
+/data
 
 # Rollout videos and wandb logs
-rollouts/
-wandb/
+/rollouts/
+/wandb/
 
 # Local training outputs and checkpoints
-runs/
+/runs/
+
+# Downloaded model weights and local runtime artifacts.  Keep these patterns
+# rooted: unanchored ``models/`` previously hid source packages such as
+# ``prismatic/models`` from Git.
+/models
+/logs/
+/results/
+/.libero/
+/calvin_data/
+/audit_artifacts/
+/paper_experiment_gap_report/
+/third_party/calvin_runtime/
+
+# Manual source snapshots kept outside Git history
+.codex_backup/
+*.orig
+*.bak
+*.tmp
+
+# Local audit reports and editor recovery files
+/AVA_VLA_CODE_AUDIT_REPORT.md
+/IMPLEMENTATION_AND_VALIDATION_REPORT.md
+/scripts/.efc_*

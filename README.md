@@ -1,249 +1,401 @@
-# 🤖 AVA-VLA: Think Less, Act Early
+# AVA-VLA
 
-### ⚡ Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models
+Official implementation and reproduction toolkit for **AVA-VLA: Think Less, Act Early**.
 
-✨ **AVA-VLA** extends Vision-Language-Action models with latent reasoning, reinforcement-learning-based denoising, and adaptive early exit.
+[Paper](https://arxiv.org/abs/2606.15099) · [Detailed implementation notes](IMPLEMENTATION_REPRODUCTION_NOTES.md) · [LIBERO setup](LIBERO.md) · [General setup](SETUP.md)
 
-🎯 The goal is to reduce unnecessary reasoning steps while preserving robust robotic control behavior.
+AVA-VLA adds reinforced latent reasoning and dynamic early exit to an OpenVLA/OpenVLA-OFT policy. This repository provides the four-stage training pipeline, distributed online rollouts, checkpoint recovery, benchmark evaluation, and result aggregation used for the main experiments.
 
-![AVA-VLA overview](assets/avavla_overview.png)
+## Installation
 
-## 🔑 Highlights
-
-- **Latent reasoning**: models intermediate reasoning as continuous latent state evolution instead of explicit text chain-of-thought generation.
-- **RL-based denoising**: optimizes latent reasoning trajectories with task-level rewards and trajectory consistency terms.
-- **Adaptive early exit**: stops latent reasoning when the exit gate estimates that the current state is sufficiently confident.
-- **OpenVLA-compatible tooling**: keeps the OpenVLA/Prismatic training, fine-tuning, and robot evaluation structure used by this codebase.
-
-## 📁 Repository Layout
-
-```text
-AVA-VLA/
-├── prismatic/
-│   └── models/vlas/avavla.py        # AVA-VLA model implementation
-├── vla-scripts/
-│   ├── finetune_avavla.py           # AVA-VLA fine-tuning entrypoint
-│   ├── finetune.py                  # OpenVLA/OFT fine-tuning entrypoint
-│   └── deploy_avavla.py             # AVA-VLA inference entrypoint
-├── scripts/
-│   ├── train_avavla_libero_10sample.py
-│   ├── evaluate_avavla.py
-│   ├── test_avavla.py
-│   └── test_avavla_simple.py
-├── experiments/robot/libero/        # LIBERO evaluation utilities
-├── experiments/robot/aloha/         # ALOHA evaluation utilities
-├── SETUP.md                         # Environment setup notes
-├── LIBERO.md                        # LIBERO-specific instructions
-├── ALOHA.md                         # ALOHA-specific instructions
-└── AVA_VLA_README.md                # Additional AVA-VLA architecture notes
-```
-
-## 📦 Installation
-
-Create a Python 3.10 environment and install the repository in editable mode:
+Python 3.10 and CUDA-capable PyTorch are recommended. The reference environment uses PyTorch 2.2. The launchers use the repository-local `.venv` environment created below.
 
 ```bash
-conda create -n avavla python=3.10 -y
-conda activate avavla
+git submodule update --init third_party/LIBERO
+
+python3.10 -m venv .venv
+source .venv/bin/activate
 
 pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0
 pip install -e .
-```
-
-For training, install Flash Attention 2 after the editable install if your CUDA/PyTorch environment supports it:
-
-```bash
 pip install packaging ninja
-ninja --version
 pip install "flash-attn==2.5.5" --no-build-isolation
-```
-
-For LIBERO evaluation and rollout experiments, also install the LIBERO package and requirements:
-
-```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-pip install -e LIBERO
+pip install -e third_party/LIBERO
 pip install -r experiments/robot/libero/libero_requirements.txt
 ```
 
-See [SETUP.md](SETUP.md), [LIBERO.md](LIBERO.md), and [ALOHA.md](ALOHA.md) for more setup details.
-
-## 💾 Checkpoints and Data
-
-This v1.0.0 code release does **not** publish AVA-VLA checkpoints. To use the code, train AVA-VLA from the provided scripts or start from public base models such as `openvla/openvla-7b` where appropriate.
-
-Public data references used by the existing OpenVLA/LIBERO workflow:
-
-- LIBERO RLDS datasets: `openvla/modified_libero_rlds`
-- OpenVLA base model: `openvla/openvla-7b`
-- LIBERO benchmark: https://github.com/Lifelong-Robot-Learning/LIBERO
-
-Use local environment variables to keep paths machine-independent:
+Set the runtime environment from the repository root:
 
 ```bash
-export DATA_ROOT=/path/to/datasets
-export RUN_ROOT=/path/to/runs
-export CHECKPOINT_DIR=/path/to/checkpoints
+export LIBERO_CONFIG_PATH="$PWD/.libero"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export PYTHONPATH="$PWD/third_party/LIBERO:$PWD"
+export TOKENIZERS_PARALLELISM=false
 ```
 
-## ✅ Environment and Code Sanity Checks
-
-These checks do not require released AVA-VLA checkpoints. They verify that the package, core modules, and command-line entrypoints are available after dependency installation.
-
-Run the lightweight AVA-VLA tests:
+For CALVIN, initialize its pinned submodule and install the simulator dependencies:
 
 ```bash
-python scripts/test_avavla_simple.py
-python scripts/test_avavla.py
+git submodule update --init --recursive third_party/calvin
+bash scripts/install_calvin_runtime.sh
 ```
 
-Check script imports and CLI parsing:
+## Models and datasets
+
+Place the robot-pretrained OpenVLA checkpoint, tokenizer, and LIBERO RLDS datasets under the following paths, or override the corresponding launcher environment variables:
+
+```text
+models/
+├── openvla-7b-modelscope-prismatic/
+│   ├── BASE_VERIFIED.json
+│   ├── config.json
+│   ├── dataset_statistics.json
+│   └── checkpoints/step-295000-epoch-40-loss=0.2200.pt
+├── openvla-7b-dinosiglip-384-prismatic/  # optional paper-resolution base
+│   ├── BASE_VERIFIED.json
+│   ├── config.json
+│   ├── dataset_statistics.json
+│   └── checkpoints/<verified-robot-checkpoint>.pt
+└── llama2-7b-ms-tokenizer/
+
+data/modified_libero_rlds/
+├── libero_spatial_no_noops/1.0.0/
+├── libero_object_no_noops/1.0.0/
+├── libero_goal_no_noops/1.0.0/
+└── libero_10_no_noops/1.0.0/
+```
+
+The training launchers expect an OpenVLA/OXE robot-pretrained base with a DINOv2+SigLIP vision backbone. Validate the checkpoint before starting a full run:
 
 ```bash
-python vla-scripts/finetune_avavla.py --help
-python scripts/evaluate_avavla.py --help
-python experiments/robot/libero/run_libero_eval.py --help
+./.venv/bin/python scripts/validate_openvla_base.py \
+  models/openvla-7b-modelscope-prismatic --full-hash
 ```
 
-## 🚀 Training
+### Optional 384px vision encoder
 
-### AVA-VLA Fine-Tuning
+The default launcher profile remains `openvla-224`, so existing runs continue to use the verified
+`prism-dinosiglip-224px+7b` base. To use the paper-resolution visual encoder, select
+`VISION_BACKBONE_PROFILE=dinosiglip-384`. This profile uses the fused
+`DINOv2 + SigLIP-SO/14 @ 384px` backbone registered as `dinosiglip-vit-so-384px` and enables the
+runtime `--require_384px_backbone true` guard.
 
-Fine-tune AVA-VLA on an RLDS dataset:
+A 224px OpenVLA checkpoint is **not** converted or partially loaded into the 384px encoder. Supply a
+separate Prismatic checkpoint that is already OXE/robot-pretrained with `prism-dinosiglip+7b`, plus
+matching dataset statistics and `BASE_VERIFIED.json`. The generic multimodal
+`models/prism-dinosiglip+7b` artifact is not an OXE robot base and is intentionally rejected.
+Validate a candidate before allocating GPUs:
 
 ```bash
-python vla-scripts/finetune_avavla.py \
-    --vla_path "$CHECKPOINT_DIR/prismatic-openvla-run" \
-    --data_root_dir "$DATA_ROOT/modified_libero_rlds" \
-    --dataset_name libero_spatial_no_noops \
-    --run_root_dir "$RUN_ROOT/avavla" \
-    --batch_size 1 \
-    --max_steps 10000 \
-    --history_window_size 2 \
-    --reasoning_policy_type softmax \
-    --ppo_clip_ratio 0.2 \
-    --gae_lambda 0.95
+./.venv/bin/python scripts/validate_avavla_vision_base.py \
+  models/openvla-7b-dinosiglip-384-prismatic \
+  --expected-resolution 384 --full-hash
 ```
 
-Important AVA-VLA options include:
-
-- `--history_window_size`: number of RLDS steps used to construct historical context.
-- `--reasoning_policy_type`: latent reasoning policy type, commonly `softmax`.
-- `--ppo_clip_ratio`: PPO clipping ratio for RL denoising updates.
-- `--gae_lambda`: GAE lambda used in advantage estimation.
-- `--run_root_dir`: output directory for logs and checkpoints.
-
-### 10-Sample Smoke Test
-
-For a small local sanity check, run the 10-sample LIBERO script with explicit dataset and output paths:
+Run one-policy-per-suite reproduction with 384px input:
 
 ```bash
-python scripts/train_avavla_libero_10sample.py \
-    --tfrecord "$DATA_ROOT/modified_libero_rlds/libero_spatial_no_noops/1.0.0/libero_spatial-train.tfrecord-00000-of-00016" \
-    --train-samples 10 \
-    --eval-samples 10 \
-    --bc-steps 10 \
-    --latent-warmup-steps 5 \
-    --ppo-steps 10 \
-    --ppo-epochs 4 \
-    --ppo-minibatch-size 4 \
-    --exit-calibration-steps 5 \
-    --exit-calibration-target-rate 0.5 \
-    --batch-size 4 \
-    --output-dir "$RUN_ROOT/avavla_libero_10sample"
+mkdir -p logs/paper_reproduction_dinosiglip384
+nohup env \
+  VISION_BACKBONE_PROFILE=dinosiglip-384 \
+  BASE_MODEL="$PWD/models/openvla-7b-dinosiglip-384-prismatic" \
+  PAPER_SEEDS="0 1 2" EVAL_SHARDS=8 \
+  bash scripts/run_paper_libero_per_suite.sh \
+  >>logs/paper_reproduction_dinosiglip384/launcher.log 2>&1 </dev/null &
 ```
 
-The script writes logs, metrics, checkpoints, evaluation results, configuration, and a reusable `samples_10.json` file under the output directory.
+The 384px profile writes to `runs/paper_per_suite_dinosiglip384`,
+`logs/paper_reproduction_dinosiglip384`, and `results/paper_per_suite_dinosiglip384` by default,
+so it cannot reuse or overwrite an active 224px run. The all-suite launcher accepts the same two
+environment variables and uses corresponding `paper_all_suites_dinosiglip384` directories.
+Saved checkpoints record the 384px requirement; deployment reconstructs the encoder and image
+transform from that saved configuration.
 
-### OpenVLA/OFT Baseline Fine-Tuning
+CALVIN ABC→D uses the official frame and language-annotation layout:
 
-The repository also retains the OpenVLA/OFT fine-tuning path inherited from the upstream codebase:
+```text
+calvin_data/task_ABC_D/
+├── training/
+│   ├── episode_*.npz
+│   └── lang_annotations/auto_lang_ann.npy
+└── validation/
+    ├── episode_*.npz
+    ├── lang_annotations/auto_lang_ann.npy
+    └── .hydra/merged_config.yaml
+```
+
+A small interface-test subset can be downloaded without retrieving the full dataset:
 
 ```bash
-torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
-    --vla_path openvla/openvla-7b \
-    --data_root_dir "$DATA_ROOT/modified_libero_rlds" \
-    --dataset_name libero_spatial_no_noops \
-    --run_root_dir "$RUN_ROOT/openvla_oft" \
-    --use_l1_regression True \
-    --use_diffusion False \
-    --use_film False \
-    --num_images_in_input 2 \
-    --use_proprio True \
-    --batch_size 1 \
-    --learning_rate 1e-4 \
-    --max_steps 10 \
-    --save_freq 10 \
-    --save_latest_checkpoint_only True \
-    --shuffle_buffer_size 1024 \
-    --image_aug False \
-    --lora_rank 32 \
-    --merge_lora_during_training False
+./.venv/bin/python scripts/download_calvin_debug_subset.py \
+  --output calvin_data/subset --segments-per-split 1
 ```
 
-See [LIBERO.md](LIBERO.md) for full LIBERO training and evaluation notes.
+## Training protocol
 
-## 📊 Evaluation
+AVA-VLA training consists of four consecutive stages:
 
-Offline JSON action-error and latency evaluation:
+1. Behavior cloning on robot demonstrations.
+2. Latent reasoning warmup.
+3. Joint online PPO with benchmark task rewards.
+4. Exit-gate calibration.
+
+The main experiment configuration is:
+
+| Setting | Value |
+|---|---:|
+| GPUs | 8 |
+| Training seeds | 0, 1, 2 |
+| BC steps | 100,000 |
+| Global BC batch size | 64 |
+| Per-rank RLDS shuffle buffer | 2,048 examples |
+| BC checkpoint interval | 1,000 steps |
+| Latent warmup steps | 50,000 |
+| PPO environment steps | 1,200,000 |
+| PPO effective batch size | 512 |
+| PPO minibatch size | 64 |
+| PPO epochs | 4 |
+| Policy learning rate | 3e-5 |
+| Critic learning rate | 1e-4 |
+| PPO clip ratio | 0.2 |
+| GAE lambda | 0.95 |
+| Entropy coefficient | 0.01 |
+| Smoothness coefficient | 0.1 |
+| Action PPO exploration std | 0.05 in normalized action space |
+| Action chunk length | 8 |
+| Observation history window | 9 frames |
+| Maximum reasoning steps | 5 |
+| Exit threshold | 0.55 |
+| Exit calibration steps | 10,000 |
+| Exit lookahead | 3 |
+| Exit delta | 0.05 |
+| Gradient clipping | 1.0 |
+
+The installed reference robot base is `prism-dinosiglip-224px+7b`; the optional
+`dinosiglip-384` profile selects `prism-dinosiglip+7b` from a separate compatible robot base.
+Training, online rollout, and deterministic evaluation derive image resolution and transforms from the selected checkpoint and share the same proprioception statistics, action normalization, action chunking, and history convention.
+
+## Reproducing Table 1
+
+### One policy per suite
+
+Run all four suites with three training seeds:
 
 ```bash
-python scripts/evaluate_avavla.py \
-    --benchmark json \
-    --avavla-checkpoint "$CHECKPOINT_DIR/avavla" \
-    --dataset "$DATA_ROOT/eval_dataset.json" \
-    --unnorm-key libero_spatial_no_noops \
-    --output "$RUN_ROOT/eval_results.json"
+mkdir -p logs/paper_reproduction
+
+nohup env \
+  BASE_MODEL="$PWD/models/openvla-7b-modelscope-prismatic" \
+  DATA_ROOT="$PWD/data/modified_libero_rlds" \
+  PAPER_SEEDS="0 1 2" \
+  EVAL_SHARDS=8 \
+  bash scripts/run_paper_libero_per_suite.sh \
+  >>logs/paper_reproduction/launcher.log 2>&1 </dev/null &
 ```
 
-LIBERO rollout evaluation:
+The launcher processes Spatial, Object, Goal, and Long sequentially. Each trained checkpoint is evaluated for 500 episodes: 10 tasks × 50 trials.
+
+To run one suite and one seed, set a suite filter:
 
 ```bash
-python scripts/evaluate_avavla.py \
-    --benchmark libero \
-    --avavla-checkpoint "$CHECKPOINT_DIR/avavla" \
-    --task-suite libero_spatial \
-    --num-trials-per-task 50
+env \
+  BASE_MODEL="$PWD/models/openvla-7b-modelscope-prismatic" \
+  DATA_ROOT="$PWD/data/modified_libero_rlds" \
+  PAPER_SEEDS="0" \
+  PAPER_SUITE_FILTER="libero_spatial" \
+  EVAL_SHARDS=8 \
+  bash scripts/run_paper_libero_per_suite.sh
 ```
 
-CALVIN and other external benchmarks require their own benchmark packages and evaluator scripts:
+### One policy for all four suites
+
+This setting uses the four-dataset RLDS mixture `libero_4_task_suites_no_noops`. The BC loader follows the dataset-size-balanced sampling implemented by the OpenVLA RLDS pipeline. Each DDP rank collects equal numbers of online rollouts from Spatial, Object, Goal, and Long while applying suite-specific normalization statistics.
 
 ```bash
-python scripts/evaluate_avavla.py \
-    --benchmark calvin \
-    --avavla-checkpoint "$CHECKPOINT_DIR/avavla" \
-    --external-eval-script /path/to/calvin_eval.py \
-    --task-suite abc_to_d
+mkdir -p logs/paper_all_suites
+
+nohup env \
+  BASE_MODEL="$PWD/models/openvla-7b-modelscope-prismatic" \
+  DATA_ROOT="$PWD/data/modified_libero_rlds" \
+  PAPER_SEEDS="0 1 2" \
+  EVAL_SHARDS=8 \
+  bash scripts/run_paper_libero_all_suites.sh \
+  >>logs/paper_all_suites/launcher.log 2>&1 </dev/null &
 ```
 
-## 🤖 Deployment
+For each seed, the launcher trains one checkpoint and evaluates it on all four suites. The aggregation step verifies checkpoint identity across the four result sets.
 
-Run local AVA-VLA inference with a trained checkpoint:
+### Table 1 aggregation
+
+The launchers aggregate results automatically after all requested runs finish. Existing evaluation files can also be aggregated directly:
 
 ```bash
-python vla-scripts/deploy_avavla.py \
-    --checkpoint "$CHECKPOINT_DIR/avavla" \
-    --image /path/to/image.jpg \
-    --instruction "pick up the red block"
+./.venv/bin/python scripts/aggregate_table1_ours.py \
+  --result-root results/paper_per_suite \
+  --mode per_suite \
+  --seeds 0 1 2 \
+  --output results/paper_per_suite/table1_ours_per_suite.json
+
+./.venv/bin/python scripts/aggregate_table1_ours.py \
+  --result-root results/paper_all_suites \
+  --mode all_policy \
+  --seeds 0 1 2 \
+  --output results/paper_all_suites/table1_ours_all_policy.json
 ```
 
-For robot-server deployment patterns, see [ALOHA.md](ALOHA.md).
+## Reproducing Table 3: CALVIN ABC→D
 
-## 📖 Citation
+The native CALVIN adapter streams `episode_XXXXXXX.npz` files and language annotations directly. It constructs 9-frame observation histories, 8-step relative-action targets, static/wrist RGB inputs, and AVA-VLA proprioception features. Dataset statistics are cached in `avavla_calvin_statistics.json` after the first scan.
 
-The paper has been accepted to ICML 2026. Use the following citation metadata for now:
+Run training and the official 1,000-sequence evaluation:
 
-```bibtex
-@inproceedings{lei2026avavla,
-  title = {Think Less, Act Early: Reinforced Latent Reasoning with Early Exit in Vision-Language-Action Models},
-  author = {Lei, Dianqiao and Shan, Lianlei},
-  booktitle = {International Conference on Machine Learning (ICML)},
-  year = {2026}
-}
+```bash
+CALVIN_DATA_ROOT="$PWD/calvin_data/task_ABC_D" \
+SEED=0 EVAL_SHARDS=8 \
+bash scripts/run_paper_calvin_abc.sh
 ```
 
-See [CITATION.cff](CITATION.cff) for machine-readable citation metadata.
+Evaluation reports SR@1 through SR@5 and average completed sequence length. The task oracle supplies success rewards during online PPO.
 
-## 📄 License and Attribution
+To validate the official sequence protocol without loading a model:
 
-This repository is released under the MIT License. It includes AVA-VLA-specific contributions and code adapted from upstream OpenVLA-OFT/OpenVLA/Prismatic components. See [LICENSE](LICENSE), [NOTICE](NOTICE), and [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for license and attribution details.
+```bash
+PYTHONPATH="$PWD/third_party/calvin_runtime:$PWD/third_party/calvin/calvin_models:$PWD/third_party/calvin/calvin_env:$PWD" \
+./.venv/bin/python experiments/robot/calvin/run_calvin_eval.py \
+  --protocol-only --num-sequences 10 \
+  --output results/calvin_protocol_check.json
+```
+
+## Reproducing Table 5: early-exit threshold sweep
+
+Table 5 reuses a trained Table 1 all-suite checkpoint and evaluates the following exit thresholds:
+
+```text
+0.30, 0.40, 0.50, 0.55, 0.65, 0.75, 0.85, 0.95, 1.00
+```
+
+```bash
+./.venv/bin/python scripts/run_table5_threshold_sweep.py \
+  --checkpoint runs/paper_all_suites/paper_all_suites_seed0 \
+  --output-root results/table5 \
+  --shards 8 \
+  --num-trials-per-task 50
+```
+
+The evaluator records success, reasoning steps, mean latency, and P90 latency for every threshold. Report the GPU model and software environment together with latency measurements.
+
+## Validation and smoke tests
+
+Run the CPU/static contracts before allocating a full training job:
+
+```bash
+./.venv/bin/python -u scripts/test_avavla_regressions.py
+./.venv/bin/python -u scripts/test_avavla_safety_regressions.py
+./.venv/bin/python -u scripts/test_libero_eval_sharding.py
+./.venv/bin/python -u scripts/test_libero_multi_suite.py
+./.venv/bin/python -u scripts/test_paper_table_adapters.py
+```
+
+Run the shortest 8-GPU four-stage integration test:
+
+```bash
+bash scripts/run_official_base_preflight.sh \
+  models/openvla-7b-modelscope-prismatic
+```
+
+Run the Table 1 all-suite integration test with 200 BC steps, 50 warmup steps, one 4,096-environment-step PPO update, and 20 exit-calibration steps:
+
+```bash
+bash scripts/run_table1_all_suites_short.sh
+```
+
+These tests validate execution, distributed communication, online environment interaction, metrics, and checkpoint structure. Reproduction results should be reported only from the full training and evaluation budgets above.
+
+## Monitoring and outputs
+
+Monitor a per-suite run with:
+
+```bash
+tail -f logs/paper_reproduction/status.log
+tail -f logs/paper_reproduction/libero_spatial.seed0.train.log
+watch -n 2 nvidia-smi
+```
+
+The launcher writes `pipeline.pid` automatically. Start 30-second GPU, process, filesystem, and
+host-memory telemetry with:
+
+```bash
+nohup bash scripts/record_paper_telemetry.sh \
+  >>logs/paper_reproduction/telemetry.log 2>&1 </dev/null &
+```
+
+The CSV outputs are `gpu_telemetry.csv`, `process_telemetry.csv`, and
+`host_memory_telemetry.csv` under the selected log directory. Set `LOG_ROOT` when monitoring an
+all-suite run with a custom log directory.
+
+Training metrics are written as JSON Lines:
+
+```text
+runs/paper_per_suite/paper_<suite>_seed<seed>/metrics.jsonl
+```
+
+Generate loss plots and CSV data with:
+
+```bash
+./.venv/bin/python scripts/plot_avavla_losses.py \
+  runs/paper_per_suite/paper_spatial_seed0/metrics.jsonl \
+  --output-dir results/paper_per_suite/libero_spatial/seed0/training_curves
+```
+
+Main result files:
+
+```text
+results/paper_per_suite/<suite>/seed<seed>/evaluation_results.json
+results/paper_per_suite/table1_ours_per_suite.json
+results/paper_all_suites/table1_ours_all_policy.json
+results/table5/table5_results.json
+```
+
+LIBERO evaluation uses 10 tasks, 50 trials per task, center crop, proprioception normalization, latent history, and an open-loop action chunk of 8.
+
+## Checkpoint recovery
+
+Each resumable checkpoint contains a `CHECKPOINT_COMPLETE.json` manifest. The manifest records all required components and their byte sizes so interrupted or partially copied checkpoints are not resumed as complete runs.
+
+BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The paper launchers validate and resume compatible checkpoints automatically. `SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
+
+For a manual distributed resume, keep all experiment arguments identical to the original run:
+
+```bash
+./.venv/bin/torchrun --standalone --nproc-per-node=8 \
+  vla-scripts/finetune_avavla.py \
+  --vla_path runs/paper_per_suite/paper_spatial_seed0 \
+  --resume true \
+  ...
+```
+
+## Repository structure
+
+```text
+prismatic/models/vlas/avavla.py             AVA-VLA model and training objectives
+vla_scripts/online_policy.py                Online policy utilities and normalization
+vla-scripts/finetune_avavla.py              Four-stage distributed trainer
+vla-scripts/deploy_avavla.py                Deterministic inference and deployment
+experiments/robot/libero/online_rollout.py   LIBERO online collectors
+experiments/robot/calvin/dataset.py          CALVIN dataset adapter
+experiments/robot/calvin/online_rollout.py   CALVIN online collector
+experiments/robot/calvin/run_calvin_eval.py  CALVIN sequence evaluation
+scripts/aggregate_table1_ours.py             Table 1 aggregation
+scripts/run_table5_threshold_sweep.py        Table 5 evaluation
+```
+
+Architecture details, PPO data flow, normalization contracts, checkpoint schema, and extended debugging instructions are documented in [IMPLEMENTATION_REPRODUCTION_NOTES.md](IMPLEMENTATION_REPRODUCTION_NOTES.md).
+
+## Citation
+
+If AVA-VLA is useful for your research, please cite the AVA-VLA paper together with the OpenVLA/OpenVLA-OFT works used by your experiment. Citation metadata is available in [CITATION.cff](CITATION.cff).
+
+## Acknowledgements
+
+This project builds on OpenVLA/OpenVLA-OFT, LIBERO, and CALVIN. Please follow the licenses and citation requirements of the corresponding upstream projects and datasets.

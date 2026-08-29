@@ -36,8 +36,8 @@ pip install "flash-attn==2.5.5" --no-build-isolation
 For LIBERO evaluation:
 
 ```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-pip install -e LIBERO
+git submodule update --init third_party/LIBERO
+pip install -e third_party/LIBERO
 pip install -r experiments/robot/libero/libero_requirements.txt
 ```
 

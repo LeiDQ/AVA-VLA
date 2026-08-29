@@ -60,6 +60,8 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = True,
+        initialize_empty: bool = False,
+        config_and_tokenizer_path: Optional[str] = None,
     ) -> None:
         super().__init__(
             llm_backbone_id,
@@ -67,6 +69,8 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
             hf_token=hf_token,
             inference_mode=inference_mode,
             use_flash_attention_2=use_flash_attention_2,
+            initialize_empty=initialize_empty,
+            config_and_tokenizer_path=config_and_tokenizer_path,
             **LLAMA2_MODELS[llm_backbone_id],
         )
 

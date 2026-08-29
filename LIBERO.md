@@ -18,11 +18,11 @@ Training
 
 Set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 
-Clone and install the [LIBERO repo](https://github.com/Lifelong-Robot-Learning/LIBERO) and required packages:
+Initialize the pinned [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) submodule and install the required packages:
 
 ```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-pip install -e LIBERO
+git submodule update --init third_party/LIBERO
+pip install -e third_party/LIBERO
 pip install -r experiments/robot/libero/libero_requirements.txt  # From the AVA-VLA repository root
 ```
 

@@ -1,0 +1,6 @@
+[submodule "third_party/LIBERO"]
+	path = third_party/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "third_party/calvin"]
+	path = third_party/calvin
+	url = https://github.com/mees/calvin.git

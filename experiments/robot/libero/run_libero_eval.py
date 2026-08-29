@@ -120,6 +120,8 @@ class GenerateConfig:
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    trial_shard_index: int = 0                       # Zero-based evaluation shard index
+    trial_shard_count: int = 1                       # Number of disjoint evaluation shards
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
 
@@ -128,6 +130,7 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    save_video: bool = False                         # Videos are optional; 500 MP4s slow formal evaluation.
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -149,6 +152,13 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.num_trials_per_task > 0, "num_trials_per_task must be positive"
+    assert 1 <= cfg.trial_shard_count <= cfg.num_trials_per_task, (
+        "trial_shard_count must be between 1 and num_trials_per_task"
+    )
+    assert 0 <= cfg.trial_shard_index < cfg.trial_shard_count, (
+        "trial_shard_index must be in [0, trial_shard_count)"
+    )
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -208,6 +218,8 @@ def setup_logging(cfg: GenerateConfig):
     """Set up logging to file and optionally to wandb."""
     # Create run ID
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    if cfg.trial_shard_count > 1:
+        run_id += f"--shard-{cfg.trial_shard_index}-of-{cfg.trial_shard_count}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
 
@@ -362,13 +374,14 @@ def run_episode(
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
-            if done:
+            if bool(done) or float(reward) > 0.0:
                 success = True
                 break
             t += 1
 
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
+        raise
 
     return success, replay_images
 
@@ -399,7 +412,10 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    shard_episode_indices = range(
+        cfg.trial_shard_index, cfg.num_trials_per_task, cfg.trial_shard_count
+    )
+    for episode_idx in tqdm.tqdm(shard_episode_indices):
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -422,19 +438,23 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images = run_episode(
-            cfg,
-            env,
-            task_description,
-            model,
-            resize_size,
-            processor,
-            action_head,
-            proprio_projector,
-            noisy_action_projector,
-            initial_state,
-            log_file,
-        )
+        try:
+            success, replay_images = run_episode(
+                cfg,
+                env,
+                task_description,
+                model,
+                resize_size,
+                processor,
+                action_head,
+                proprio_projector,
+                noisy_action_projector,
+                initial_state,
+                log_file,
+            )
+        except Exception:
+            env.close()
+            raise
 
         # Update counters
         task_episodes += 1
@@ -444,9 +464,10 @@ def run_task(
             total_successes += 1
 
         # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
-        )
+        if cfg.save_video:
+            save_rollout_video(
+                replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)
@@ -469,6 +490,7 @@ def run_task(
             }
         )
 
+    env.close()
     return total_episodes, total_successes
 
 
@@ -480,6 +502,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
+    cfg._reasoning_telemetry = []
 
     # Initialize model and components
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
@@ -517,6 +540,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Calculate final success rate
     final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
+    trial_indices = list(
+        range(cfg.trial_shard_index, cfg.num_trials_per_task, cfg.trial_shard_count)
+    )
+    expected_episodes = num_tasks * len(trial_indices)
+    if total_episodes != expected_episodes:
+        raise RuntimeError(
+            f"Incomplete shard evaluation: completed {total_episodes} episodes, expected {expected_episodes}."
+        )
 
     # Log final results
     log_message("Final results:", log_file)
@@ -537,6 +568,40 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Close log file
     if log_file:
         log_file.close()
+
+    latency_values = [float(row["latency_ms"]) for row in cfg._reasoning_telemetry]
+    step_values = [float(row["reasoning_steps"]) for row in cfg._reasoning_telemetry]
+    result = {
+        "task_suite": cfg.task_suite_name,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "success_rate": final_success_rate,
+        "seed": cfg.seed,
+        "checkpoint": str(cfg.pretrained_checkpoint),
+        "num_tasks": num_tasks,
+        "num_trials_per_task": cfg.num_trials_per_task,
+        "trial_shard_index": cfg.trial_shard_index,
+        "trial_shard_count": cfg.trial_shard_count,
+        "trial_indices": trial_indices,
+        "exit_threshold": cfg.exit_threshold,
+        "max_reasoning_steps": cfg.max_reasoning_steps,
+        "fixed_reasoning_steps": cfg.fixed_reasoning_steps,
+        "reasoning_telemetry": {
+            "policy_queries": len(latency_values),
+            "mean_latency_ms": float(np.mean(latency_values)) if latency_values else 0.0,
+            "p90_latency_ms": float(np.percentile(latency_values, 90)) if latency_values else 0.0,
+            "avg_reasoning_steps": float(np.mean(step_values)) if step_values else 0.0,
+            "latency_ms_values": latency_values,
+            "reasoning_steps_values": step_values,
+        },
+    }
+    result_path = Path(cfg.local_log_dir) / "evaluation_results.json"
+    temporary_result_path = result_path.with_suffix(".json.tmp")
+    with temporary_result_path.open("w", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
+    os.replace(temporary_result_path, result_path)
+    complete_path = Path(cfg.local_log_dir) / "EVALUATION_COMPLETE"
+    complete_path.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
 
     return final_success_rate
 

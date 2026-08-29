@@ -46,15 +46,37 @@ def evaluate_latency(
     """
     # Warmup runs
     for _ in range(warmup_runs):
-        _ = predict_action(model, processor, image, instruction, unnorm_key, device=device)
+        model.reset_latent_history()
+        _ = predict_action(
+            model=model,
+            processor=processor,
+            image=image,
+            instruction=instruction,
+            unnorm_key=unnorm_key,
+            device=device,
+            update_history=False,
+        )
     
     # Measure latency
     latencies = []
     reasoning_steps_list = []
     
     for _ in range(num_runs):
+        model.reset_latent_history()
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize()
         start_time = time.perf_counter()
-        actions, reasoning_info = predict_action(model, processor, image, instruction, unnorm_key, device=device)
+        actions, reasoning_info = predict_action(
+            model=model,
+            processor=processor,
+            image=image,
+            instruction=instruction,
+            unnorm_key=unnorm_key,
+            device=device,
+            update_history=False,
+        )
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize()
         end_time = time.perf_counter()
         
         latencies.append((end_time - start_time) * 1000)  # Convert to ms
@@ -109,10 +131,21 @@ def evaluate_on_dataset(
         image = Image.open(image_path).convert("RGB")
         
         # Predict
+        model.reset_latent_history()
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize()
         start_time = time.perf_counter()
         actions, reasoning_info = predict_action(
-            model, processor, image, instruction, unnorm_key, device=device
+            model=model,
+            processor=processor,
+            image=image,
+            instruction=instruction,
+            unnorm_key=unnorm_key,
+            device=device,
+            update_history=False,
         )
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize()
         end_time = time.perf_counter()
         
         # Compute error
@@ -143,6 +176,7 @@ def evaluate_on_dataset(
         "std_reasoning_steps": np.std(reasoning_steps),
         "min_reasoning_steps": np.min(reasoning_steps),
         "max_reasoning_steps": np.max(reasoning_steps),
+        "throughput_hz": 1000.0 / max(float(np.mean(latencies)), 1e-8),
     }
     
     # Compute efficiency metrics
@@ -180,7 +214,7 @@ def compare_models(
         device=device,
         enable_latent_reasoning=True,
         max_reasoning_steps=5,
-        exit_threshold=0.8,
+        exit_threshold=0.55,
     )
     
     # Evaluate AVA-VLA
@@ -245,13 +279,15 @@ def run_libero_benchmark(args) -> int:
         "--num_trials_per_task",
         str(args.num_trials_per_task),
         "--num_images_in_input",
-        "1",
+        "2",
         "--use_proprio",
-        "False",
+        "True",
         "--enable_latent_reasoning",
         str(args.enable_latent_reasoning),
         "--use_history_state",
         str(args.use_history_state),
+        "--center_crop",
+        "True",
     ]
     if args.max_reasoning_steps is not None:
         cmd.extend(["--max_reasoning_steps", str(args.max_reasoning_steps)])
@@ -271,7 +307,7 @@ def run_libero_benchmark(args) -> int:
 
 
 def run_external_benchmark(args, benchmark_name: str) -> int:
-    """Run an external CALVIN/LIBERO+ evaluator against an AVA-VLA checkpoint."""
+    """Run an external LIBERO+ evaluator against an AVA-VLA checkpoint."""
     if args.external_eval_script is None:
         raise SystemExit(
             f"`--benchmark {benchmark_name}` requires `--external-eval-script` because this repository "
@@ -293,6 +329,32 @@ def run_external_benchmark(args, benchmark_name: str) -> int:
     print(" ".join(cmd))
     completed = subprocess.run(cmd, check=False)
     return completed.returncode
+
+
+def run_calvin_benchmark(args) -> int:
+    """Run the repository's native official-protocol CALVIN ABC->D evaluator."""
+    if args.dataset is None:
+        raise SystemExit("`--benchmark calvin` requires `--dataset` pointing to task_ABC_D/debug root.")
+    output = args.output or "results/calvin/evaluation_results.json"
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "experiments/robot/calvin/run_calvin_eval.py"),
+        "--checkpoint",
+        str(args.avavla_checkpoint),
+        "--dataset-root",
+        str(args.dataset),
+        "--output",
+        str(output),
+    ]
+    if args.max_reasoning_steps is not None:
+        cmd.extend(["--max-reasoning-steps", str(args.max_reasoning_steps)])
+    if args.exit_threshold is not None:
+        cmd.extend(["--exit-threshold", str(args.exit_threshold)])
+    if args.extra_args:
+        cmd.extend(args.extra_args)
+    print("Running native CALVIN ABC->D command:")
+    print(" ".join(cmd))
+    return subprocess.run(cmd, check=False).returncode
 
 
 def print_comparison_results(comparison_results: Dict):
@@ -368,7 +430,7 @@ def main():
     parser.add_argument("--exit-threshold", type=float, default=None,
                        help="Override early-exit threshold")
     parser.add_argument("--external-eval-script", type=Path, default=None,
-                       help="External CALVIN/LIBERO+ evaluator script")
+                       help="External LIBERO+ evaluator script (CALVIN is native)")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER,
                        help="Additional arguments forwarded to the selected benchmark evaluator")
     
@@ -378,7 +440,9 @@ def main():
 
     if args.benchmark == "libero":
         raise SystemExit(run_libero_benchmark(args))
-    if args.benchmark in {"calvin", "libero_plus"}:
+    if args.benchmark == "calvin":
+        raise SystemExit(run_calvin_benchmark(args))
+    if args.benchmark == "libero_plus":
         raise SystemExit(run_external_benchmark(args, args.benchmark))
 
     if args.dataset is None or args.unnorm_key is None:

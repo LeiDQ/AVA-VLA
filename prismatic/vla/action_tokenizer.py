@@ -35,16 +35,21 @@ class ActionTokenizer:
         #   =>> Assumes we're always overwriting the final `n_bins` tokens of the vocabulary!
         self.action_token_begin_idx: int = int(self.tokenizer.vocab_size - (self.n_bins + 1))
 
-    def __call__(self, action: np.ndarray) -> Union[str, List[str]]:
-        """Clip & bin actions to *the last `n_bins` tokens* of the vocabulary (e.g., tokenizer.vocab[-256:])."""
+    def encode_actions_to_token_ids(self, action: np.ndarray) -> np.ndarray:
+        """Clip and bin continuous actions, returning the exact discrete token IDs."""
         action = np.clip(action, a_min=float(self.min_action), a_max=float(self.max_action))
         discretized_action = np.digitize(action, self.bins)
+        return self.tokenizer.vocab_size - discretized_action
+
+    def __call__(self, action: np.ndarray) -> Union[str, List[str]]:
+        """Clip & bin actions to *the last `n_bins` tokens* of the vocabulary (e.g., tokenizer.vocab[-256:])."""
+        action_token_ids = self.encode_actions_to_token_ids(action)
 
         # Handle single element vs. batch
-        if len(discretized_action.shape) == 1:
-            return self.tokenizer.decode(list(self.tokenizer.vocab_size - discretized_action))
+        if len(action_token_ids.shape) == 1:
+            return self.tokenizer.decode(action_token_ids.tolist())
         else:
-            return self.tokenizer.batch_decode((self.tokenizer.vocab_size - discretized_action).tolist())
+            return self.tokenizer.batch_decode(action_token_ids.tolist())
 
     def decode_token_ids_to_actions(self, action_token_ids: np.ndarray) -> np.ndarray:
         """

@@ -76,13 +76,18 @@ LLM_BACKBONES = {
 
 
 def get_vision_backbone_and_transform(
-    vision_backbone_id: str, image_resize_strategy: str
+    vision_backbone_id: str, image_resize_strategy: str, initialize_empty: bool = False
 ) -> Tuple[VisionBackbone, ImageTransform]:
     """Instantiate a Vision Backbone, returning both the nn.Module wrapper class and default Image Transform."""
     if vision_backbone_id in VISION_BACKBONES:
         vision_cfg = VISION_BACKBONES[vision_backbone_id]
+        vision_kwargs = dict(vision_cfg["kwargs"])
+        if initialize_empty:
+            if vision_cfg["cls"] is not DinoSigLIPViTBackbone:
+                raise ValueError("Empty initialization is currently supported only for the paper's DinoSigLIP backbone.")
+            vision_kwargs["pretrained"] = False
         vision_backbone: VisionBackbone = vision_cfg["cls"](
-            vision_backbone_id, image_resize_strategy, **vision_cfg["kwargs"]
+            vision_backbone_id, image_resize_strategy, **vision_kwargs
         )
         image_transform = vision_backbone.get_image_transform()
         return vision_backbone, image_transform
@@ -96,14 +101,25 @@ def get_llm_backbone_and_tokenizer(
     llm_max_length: int = 2048,
     hf_token: Optional[str] = None,
     inference_mode: bool = False,
+    initialize_empty: bool = False,
+    config_and_tokenizer_path: Optional[str] = None,
 ) -> Tuple[LLMBackbone, PreTrainedTokenizerBase]:
     if llm_backbone_id in LLM_BACKBONES:
         llm_cfg = LLM_BACKBONES[llm_backbone_id]
+        runtime_kwargs = {}
+        if initialize_empty:
+            if llm_cfg["cls"] is not LLaMa2LLMBackbone:
+                raise ValueError("Empty initialization is currently supported only for the paper's Llama-2 backbone.")
+            runtime_kwargs = {
+                "initialize_empty": True,
+                "config_and_tokenizer_path": config_and_tokenizer_path,
+            }
         llm_backbone: LLMBackbone = llm_cfg["cls"](
             llm_backbone_id,
             llm_max_length=llm_max_length,
             hf_token=hf_token,
             inference_mode=inference_mode,
+            **runtime_kwargs,
             **llm_cfg["kwargs"],
         )
         tokenizer = llm_backbone.get_tokenizer()

@@ -19,6 +19,8 @@ from transformers import LlamaTokenizerFast
 from prismatic.models.vlas.openvla import OpenVLA
 from prismatic.models.vlms.prismatic import IGNORE_INDEX, PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
+from prismatic.vla.constants import ACTION_PROPRIO_NORMALIZATION_TYPE, NormalizationType
+from prismatic.vla.preprocessing import center_crop_for_augmentation
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -46,24 +48,39 @@ def _match_last_dim(values: torch.Tensor, target_dim: int) -> torch.Tensor:
     return torch.cat([values, pad], dim=-1)
 
 
+def _floating_parameter_dtype(module: object, fallback: torch.dtype) -> torch.dtype:
+    """Return a module's floating compute dtype without assuming it is an nn.Module.
+
+    Online trajectories are intentionally stored in BF16, while the small PPO
+    heads remain FP32 for stability.  Explicitly matching inputs to the owning
+    module avoids relying on an ambient autocast context during PPO replay.
+    """
+    parameters = getattr(module, "parameters", None)
+    if callable(parameters):
+        for parameter in parameters():
+            if torch.is_floating_point(parameter):
+                return parameter.dtype
+    return fallback
+
+
 class ReasoningPolicy(nn.Module):
     """
     Reasoning policy π_phi(u_t | z_t, o_t).
 
-    The default policy is a Softmax over latent update modes. A conditional Gaussian mode is available for
-    continuous update-action experiments.
+    The paper-default policy is a conditional Gaussian over continuous latent update actions. A Softmax mode
+    remains available for ablations.
     """
 
     def __init__(
         self,
         latent_dim: int,
         obs_dim: int,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 512,
         update_dim: int = 64,
         num_heads: int = 8,
-        num_layers: int = 2,
+        num_layers: int = 4,
         dropout: float = 0.1,
-        policy_type: str = "softmax",
+        policy_type: str = "gaussian",
         min_log_std: float = -5.0,
         max_log_std: float = 2.0,
     ) -> None:
@@ -75,13 +92,18 @@ class ReasoningPolicy(nn.Module):
         self.min_log_std = min_log_std
         self.max_log_std = max_log_std
 
-        self.input_proj = nn.Linear(latent_dim + obs_dim, hidden_dim)
+        # Keep state and observation as distinct tokens.  A one-token Transformer
+        # reduces self-attention to an MLP and cannot implement the architecture
+        # described in Appendix B.2.
+        self.latent_input_proj = nn.Linear(latent_dim, hidden_dim)
+        self.obs_input_proj = nn.Linear(obs_dim, hidden_dim)
+        self.token_type_embeddings = nn.Parameter(torch.zeros(2, hidden_dim))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
-            activation="gelu",
+            activation="relu",
             batch_first=True,
             norm_first=True,
         )
@@ -89,7 +111,7 @@ class ReasoningPolicy(nn.Module):
         output_head = [
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Dropout(dropout),
         ]
         if policy_type == "gaussian":
@@ -97,7 +119,7 @@ class ReasoningPolicy(nn.Module):
             self.output_log_std = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
+                nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, update_dim),
             )
@@ -117,9 +139,12 @@ class ReasoningPolicy(nn.Module):
         Returns:
             policy_output: Distribution parameters for either Gaussian or Softmax mode.
         """
-        combined = torch.cat([z_t, o_t], dim=-1)
-        token = self.input_proj(combined).unsqueeze(1)
-        hidden = self.transformer(token).squeeze(1)
+        tokens = torch.stack(
+            [self.latent_input_proj(z_t), self.obs_input_proj(o_t)],
+            dim=1,
+        )
+        tokens = tokens + self.token_type_embeddings.unsqueeze(0).to(dtype=tokens.dtype)
+        hidden = self.transformer(tokens)[:, 0]
         if self.policy_type == "softmax":
             logits = self.output_logits(hidden)
             return {
@@ -202,15 +227,17 @@ class LatentTransition(nn.Module):
         hidden_dim: int = 1024,
         update_dim: int = 64,
         num_heads: int = 8,
+        num_obs_tokens: int = 4,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.obs_dim = obs_dim
         self.update_dim = update_dim
+        self.num_obs_tokens = num_obs_tokens
 
         self.latent_proj = nn.Linear(latent_dim, hidden_dim)
-        self.obs_proj = nn.Linear(obs_dim, hidden_dim)
+        self.obs_proj = nn.Linear(obs_dim, hidden_dim * num_obs_tokens)
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -247,11 +274,19 @@ class LatentTransition(nn.Module):
             z_{t+1}: Updated latent state [B, latent_dim]
         """
         latent_token = self.latent_proj(z_t).unsqueeze(1)
-        obs_token = self.obs_proj(o_t).unsqueeze(1)
-        attended_obs, _ = self.cross_attention(latent_token, obs_token, obs_token, need_weights=False)
+        obs_tokens = self.obs_proj(o_t).reshape(o_t.shape[0], self.num_obs_tokens, -1)
+        attended_obs, _ = self.cross_attention(latent_token, obs_tokens, obs_tokens, need_weights=False)
         attended_obs = attended_obs.squeeze(1)
         gru_input = torch.cat([z_t, o_t], dim=-1)
-        gru_hidden = self.gru(gru_input, self.update_hidden(u_t))
+
+        # PyTorch 2.2 does not implement the fused CUDA GRUCell kernel for BF16.
+        # Keep the recurrent state update in FP32 for numerical stability while
+        # allowing the surrounding Transformer/MLPs to remain under BF16 autocast.
+        with torch.autocast(device_type=z_t.device.type, enabled=False):
+            gru_hidden = self.gru(
+                gru_input.float(),
+                self.update_hidden(u_t.float()).float(),
+            )
 
         delta_input = torch.cat([gru_hidden, attended_obs], dim=-1)
         delta_z = self.delta_net(delta_input)
@@ -260,23 +295,37 @@ class LatentTransition(nn.Module):
         return self.state_norm(z_t + gate * delta_z)
 
 
+class _ResidualMLPBlock(nn.Module):
+    """Pre-normalized residual MLP used by the paper's exit gate."""
+
+    def __init__(self, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + self.block(value)
+
+
 class ExitGate(nn.Module):
     """Exit determination function g_omega(z_t), returning state sufficiency in [0, 1]."""
 
     def __init__(self, latent_dim: int, hidden_dim: int = 256, dropout: float = 0.1) -> None:
         super().__init__()
-        self.net = nn.Sequential(
+        self.input = nn.Sequential(
             nn.LayerNorm(latent_dim),
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
         )
+        self.residual = _ResidualMLPBlock(hidden_dim, dropout)
+        self.output = nn.Linear(hidden_dim, 1)
 
     def forward(self, z_t: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(z_t))
+        return torch.sigmoid(self.output(self.residual(self.input(z_t))))
 
 
 class ValueFunction(nn.Module):
@@ -305,7 +354,7 @@ class AVAVLA(OpenVLA):
 
     The model augments OpenVLA with:
     - latent reasoning states z_t,
-    - a Softmax reasoning policy π_phi over internal update actions,
+    - a continuous Gaussian reasoning policy π_phi over internal update actions,
     - gated incremental transition dynamics f_theta,
     - Actor-Critic RL denoising with entropy and smoothness penalties,
     - adaptive early-exit over the latent reasoning stream,
@@ -314,7 +363,10 @@ class AVAVLA(OpenVLA):
 
     AVA_PARAMETER_PREFIXES = (
         "visual_obs_proj",
+        "projector",
+        "visual_view_fusion",
         "text_obs_proj",
+        "proprio_obs_proj",
         "history_obs_proj",
         "obs_fusion",
         "initial_latent_proj",
@@ -331,14 +383,18 @@ class AVAVLA(OpenVLA):
         *args,
         latent_dim: int = 512,
         obs_dim: int = 768,
-        reasoning_hidden_dim: int = 1024,
+        reasoning_hidden_dim: int = 512,
+        reasoning_num_heads: int = 8,
+        reasoning_num_layers: int = 4,
         transition_hidden_dim: int = 1024,
         exit_gate_hidden_dim: int = 256,
         value_hidden_dim: int = 512,
         update_dim: int = 64,
-        reasoning_policy_type: str = "softmax",
+        proprio_dim: int = 8,
+        dropout: float = 0.1,
+        reasoning_policy_type: str = "gaussian",
         max_reasoning_steps: int = 5,
-        exit_threshold: float = 0.8,
+        exit_threshold: float = 0.55,
         enable_latent_reasoning: bool = True,
         **kwargs,
     ) -> None:
@@ -347,6 +403,7 @@ class AVAVLA(OpenVLA):
         self.latent_dim = latent_dim
         self.obs_dim = obs_dim
         self.update_dim = update_dim
+        self.proprio_dim = proprio_dim
         self.reasoning_policy_type = reasoning_policy_type
         self.max_reasoning_steps = max_reasoning_steps
         self.exit_threshold = exit_threshold
@@ -359,13 +416,24 @@ class AVAVLA(OpenVLA):
         if self.enable_latent_reasoning:
             # ψ(o_t): visual, language, and optional history encodings fused into a unified observation vector.
             self.visual_obs_proj = nn.Linear(self.vision_dim, obs_dim)
+            self.visual_view_fusion = nn.Sequential(
+                nn.LayerNorm(self.vision_dim * 2),
+                nn.Linear(self.vision_dim * 2, self.vision_dim),
+                nn.GELU(),
+            )
             self.text_obs_proj = nn.Linear(self.llm_dim, obs_dim)
+            self.proprio_obs_proj = nn.Sequential(
+                nn.LayerNorm(proprio_dim),
+                nn.Linear(proprio_dim, obs_dim),
+                nn.GELU(),
+                nn.Linear(obs_dim, obs_dim),
+            )
             self.history_obs_proj = nn.Linear(latent_dim, obs_dim)
             self.obs_fusion = nn.Sequential(
-                nn.LayerNorm(obs_dim * 3),
-                nn.Linear(obs_dim * 3, obs_dim),
+                nn.LayerNorm(obs_dim * 4),
+                nn.Linear(obs_dim * 4, obs_dim),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(obs_dim, obs_dim),
                 nn.LayerNorm(obs_dim),
             )
@@ -380,16 +448,24 @@ class AVAVLA(OpenVLA):
                 obs_dim=obs_dim,
                 hidden_dim=reasoning_hidden_dim,
                 update_dim=update_dim,
+                num_heads=reasoning_num_heads,
+                num_layers=reasoning_num_layers,
+                dropout=dropout,
                 policy_type=reasoning_policy_type,
             )
+            if reasoning_policy_type == "gaussian":
+                # Appendix B.3 initializes the reasoning policy with zero-mean Gaussian updates.
+                nn.init.zeros_(self.reasoning_policy.output_mean[-1].weight)
+                nn.init.zeros_(self.reasoning_policy.output_mean[-1].bias)
             self.latent_transition = LatentTransition(
                 latent_dim=latent_dim,
                 obs_dim=obs_dim,
                 hidden_dim=transition_hidden_dim,
                 update_dim=update_dim,
+                dropout=dropout,
             )
-            self.exit_gate = ExitGate(latent_dim=latent_dim, hidden_dim=exit_gate_hidden_dim)
-            self.value_function = ValueFunction(latent_dim=latent_dim, hidden_dim=value_hidden_dim)
+            self.exit_gate = ExitGate(latent_dim=latent_dim, hidden_dim=exit_gate_hidden_dim, dropout=dropout)
+            self.value_function = ValueFunction(latent_dim=latent_dim, hidden_dim=value_hidden_dim, dropout=dropout)
 
             # h_psi([z_t, ψ(o_t)]): inject finalized latent reasoning into the action-generation hidden stream.
             self.latent_to_llm = nn.Sequential(
@@ -403,7 +479,9 @@ class AVAVLA(OpenVLA):
             if self.all_module_keys is not None:
                 self.all_module_keys = self.all_module_keys + [
                     "visual_obs_proj",
+                    "visual_view_fusion",
                     "text_obs_proj",
+                    "proprio_obs_proj",
                     "history_obs_proj",
                     "obs_fusion",
                     "initial_latent_proj",
@@ -458,13 +536,82 @@ class AVAVLA(OpenVLA):
             return None
         return cached
 
+    def normalize_proprio(
+        self,
+        proprio: np.ndarray,
+        unnorm_key: Optional[str],
+    ) -> np.ndarray:
+        """Normalize raw proprioception with the exact RLDS training statistics."""
+        if unnorm_key is None:
+            if len(self.norm_stats) != 1:
+                raise ValueError("unnorm_key is required when multiple dataset statistics are loaded")
+            unnorm_key = next(iter(self.norm_stats))
+        if unnorm_key not in self.norm_stats:
+            raise KeyError(f"Missing normalization statistics for {unnorm_key!r}")
+        proprio_stats = self.norm_stats[unnorm_key].get("proprio")
+        if proprio_stats is None:
+            raise KeyError(f"Missing proprio statistics for {unnorm_key!r}")
+
+        values = np.asarray(proprio, dtype=np.float32)
+        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
+            low = np.asarray(proprio_stats["min"], dtype=np.float32)
+            high = np.asarray(proprio_stats["max"], dtype=np.float32)
+        elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
+            low = np.asarray(proprio_stats["q01"], dtype=np.float32)
+            high = np.asarray(proprio_stats["q99"], dtype=np.float32)
+        else:
+            raise ValueError(
+                f"Unsupported proprio normalization type: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+            )
+        mask = np.asarray(proprio_stats.get("mask", np.ones_like(low, dtype=bool)), dtype=bool)
+        scaled = 2.0 * (values - low) / (high - low + 1e-8) - 1.0
+        normalized = np.where(mask, np.clip(scaled, -1.0, 1.0), values)
+        return normalized.astype(np.float32)
+
+    def fuse_observation_features(self, features: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Apply trainable multimodal fusion to cached, action-free backbone features.
+
+        Online PPO stores these compact frozen-backbone features and rebuilds
+        the observation encoding on every PPO replay.  This keeps PPO gradients
+        connected to the multimodal projections and initial latent state without
+        repeatedly executing the frozen vision and Llama backbones.
+        """
+        obs_dtype = self.visual_obs_proj.weight.dtype
+        primary_encoding = features["primary_visual"].to(dtype=obs_dtype)
+        wrist_encoding = features["wrist_visual"].to(
+            device=primary_encoding.device,
+            dtype=obs_dtype,
+        )
+        text_encoding = features["text"].to(device=primary_encoding.device, dtype=obs_dtype)
+        proprio_features = features["proprio"].to(device=primary_encoding.device, dtype=obs_dtype)
+        history_features = features["history"].to(device=primary_encoding.device, dtype=obs_dtype)
+
+        visual_encoding = self.visual_view_fusion(
+            torch.cat([primary_encoding, wrist_encoding], dim=-1)
+        )
+        visual_obs = self.visual_obs_proj(visual_encoding)
+        text_obs = self.text_obs_proj(text_encoding)
+        proprio_obs = self.proprio_obs_proj(
+            _match_last_dim(proprio_features, self.proprio_dim)
+        )
+        history_obs = self.history_obs_proj(
+            _match_last_dim(history_features, self.latent_dim)
+        )
+        return self.obs_fusion(
+            torch.cat([visual_obs, text_obs, proprio_obs, history_obs], dim=-1)
+        )
+
     def encode_observation(
         self,
         pixel_values: torch.Tensor | Dict[str, torch.Tensor],
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         history_states: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        pixel_values_wrist: Optional[torch.Tensor | Dict[str, torch.Tensor]] = None,
+        proprio: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_features: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Encode o_t = {v_t, l_t, h_{t-1}} into ψ(o_t).
 
@@ -483,24 +630,68 @@ class AVAVLA(OpenVLA):
         obs_dtype = self.visual_obs_proj.weight.dtype
 
         with torch.set_grad_enabled(self.vision_backbone_requires_grad):
-            visual_features = self.vision_backbone(pixel_values)
-        visual_encoding = visual_features.mean(dim=1).to(dtype=obs_dtype)
-        visual_obs = self.visual_obs_proj(visual_encoding)
+            primary_features = self.vision_backbone(pixel_values)
+            wrist_features = (
+                self.vision_backbone(pixel_values_wrist)
+                if pixel_values_wrist is not None
+                else None
+            )
+        primary_encoding = primary_features.mean(dim=1).to(dtype=obs_dtype)
+        wrist_encoding = (
+            wrist_features.mean(dim=1).to(dtype=obs_dtype)
+            if wrist_features is not None
+            else torch.zeros_like(primary_encoding)
+        )
+        # Observation encoding must never see demonstration action tokens.  The
+        # training sequence contains prompt + ground-truth actions for the OFT
+        # action head, so use labels to derive a prompt-only mask and replace all
+        # non-prompt token identities before calling the frozen Llama encoder.
+        text_mask = (
+            torch.ones_like(input_ids, dtype=torch.bool)
+            if attention_mask is None
+            else attention_mask.to(device=input_ids.device, dtype=torch.bool)
+        )
+        if labels is not None:
+            text_mask = text_mask & labels.to(device=input_ids.device).eq(IGNORE_INDEX)
+        pad_token_id = int(self.llm_backbone.pad_token_id)
+        text_input_ids = input_ids.masked_fill(~text_mask, pad_token_id)
+        with torch.no_grad():
+            text_output = self.llm_backbone.llm.model(
+                input_ids=text_input_ids,
+                attention_mask=text_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            text_hidden = text_output.last_hidden_state
+        text_encoding = _masked_mean(text_hidden, text_mask).to(dtype=obs_dtype)
 
-        text_embeddings = self.llm_backbone.embed_input_ids(input_ids)
-        text_encoding = _masked_mean(text_embeddings, attention_mask).to(dtype=obs_dtype)
-        text_obs = self.text_obs_proj(text_encoding)
+        if proprio is None:
+            proprio_features = primary_encoding.new_zeros(primary_encoding.shape[0], self.proprio_dim)
+        else:
+            proprio_features = _match_last_dim(
+                proprio.to(device=primary_encoding.device, dtype=obs_dtype), self.proprio_dim
+            )
 
         if history_states is None:
-            history_features = visual_obs.new_zeros(visual_obs.shape[0], self.latent_dim)
+            history_features = primary_encoding.new_zeros(primary_encoding.shape[0], self.latent_dim)
         else:
             history_features = history_states
             if history_features.dim() == 3:
                 history_features = history_features.mean(dim=1)
-            history_features = _match_last_dim(history_features.to(device=visual_obs.device, dtype=obs_dtype), self.latent_dim)
-        history_obs = self.history_obs_proj(history_features)
+            history_features = _match_last_dim(
+                history_features.to(device=primary_encoding.device, dtype=obs_dtype),
+                self.latent_dim,
+            )
 
-        return self.obs_fusion(torch.cat([visual_obs, text_obs, history_obs], dim=-1))
+        features = {
+            "primary_visual": primary_encoding,
+            "wrist_visual": wrist_encoding,
+            "text": text_encoding,
+            "proprio": proprio_features,
+            "history": history_features,
+        }
+        obs_encoding = self.fuse_observation_features(features)
+        return (obs_encoding, features) if return_features else obs_encoding
 
     def latent_reasoning_forward(
         self,
@@ -509,6 +700,7 @@ class AVAVLA(OpenVLA):
         num_steps: Optional[int] = None,
         training: bool = False,
         return_trajectory: bool = True,
+        force_fixed_steps: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Run latent reasoning with adaptive early exit.
@@ -551,11 +743,32 @@ class AVAVLA(OpenVLA):
             step_active = active if not training else torch.ones_like(active)
             valid_masks.append(step_active)
 
+            # True dynamic batching: after a sample exits, do not execute its
+            # policy, transition, or exit gate on subsequent iterations.
+            active_indices = torch.nonzero(step_active, as_tuple=False).squeeze(-1)
+            if active_indices.numel() == 0:
+                break
+            z_before_active = current_z.index_select(0, active_indices)
+            obs_active = obs_encoding.index_select(0, active_indices)
+            policy_output = self.reasoning_policy(z_before_active, obs_active)
+            u_active, log_prob_active, entropy_active = self.reasoning_policy.sample_update_action(
+                policy_output,
+                training=training,
+            )
+            z_next_active = self.latent_transition(z_before_active, obs_active, u_active)
+            e_active = self.exit_gate(z_next_active).squeeze(-1)
+            # CUDA autocast can keep the latent stream in BF16 while GRU and
+            # normalization kernels return FP32.  Preserve a stable latent
+            # dtype across recurrent steps; keep policy statistics in their
+            # native (usually FP32) dtype for PPO numerical accuracy.
+            z_next_active = z_next_active.to(dtype=current_z.dtype)
+
             z_before = current_z
-            policy_output = self.reasoning_policy(z_before, obs_encoding)
-            u_t, log_prob, entropy = self.reasoning_policy.sample_update_action(policy_output, training=training)
-            z_next = self.latent_transition(z_before, obs_encoding, u_t)
-            e_t = self.exit_gate(z_next).squeeze(-1)
+            z_next = current_z.clone().index_copy(0, active_indices, z_next_active)
+            e_t = e_active.new_zeros(batch_size).index_copy(0, active_indices, e_active)
+            u_t = u_active.new_zeros(batch_size, self.update_dim).index_copy(0, active_indices, u_active)
+            log_prob = log_prob_active.new_zeros(batch_size).index_copy(0, active_indices, log_prob_active)
+            entropy = entropy_active.new_zeros(batch_size).index_copy(0, active_indices, entropy_active)
 
             if return_trajectory:
                 latent_states.append(z_before)
@@ -570,10 +783,14 @@ class AVAVLA(OpenVLA):
                 steps_per_sample += 1
                 continue
 
-            current_z = torch.where(step_active.unsqueeze(-1), z_next, current_z)
+            current_z = z_next
             steps_per_sample += step_active.long()
 
-            newly_finished = step_active & (e_t > self.exit_threshold)
+            newly_finished = (
+                torch.zeros_like(step_active)
+                if force_fixed_steps
+                else step_active & (e_t > self.exit_threshold)
+            )
             final_z = torch.where(newly_finished.unsqueeze(-1), current_z, final_z)
             active = step_active & ~newly_finished
             if not active.any():
@@ -585,10 +802,15 @@ class AVAVLA(OpenVLA):
             final_z = torch.where(active.unsqueeze(-1), current_z, final_z)
 
         exit_scores_tensor = torch.stack(exit_scores, dim=1) if exit_scores else z_t.new_zeros(batch_size, 0)
+        if exit_scores_tensor.numel():
+            last_step_indices = (steps_per_sample - 1).clamp_min(0).unsqueeze(1)
+            final_exit_scores = exit_scores_tensor.gather(1, last_step_indices).squeeze(1)
+        else:
+            final_exit_scores = z_t.new_zeros(batch_size)
         reasoning_info: Dict[str, torch.Tensor | int] = {
             "num_steps_performed": int(exit_scores_tensor.shape[1]),
             "num_steps_per_sample": steps_per_sample,
-            "final_exit_scores": exit_scores_tensor[:, -1] if exit_scores_tensor.numel() else z_t.new_zeros(batch_size),
+            "final_exit_scores": final_exit_scores,
         }
 
         if return_trajectory and latent_states:
@@ -621,6 +843,9 @@ class AVAVLA(OpenVLA):
         ppo_clip_ratio: float = 0.2,
         gae_lambda: float = 0.95,
         recompute_policy: bool = True,
+        recompute_dynamics: bool = True,
+        recompute_observation: bool = True,
+        train_exit_gate: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute RL-based latent reasoning denoising loss.
@@ -633,14 +858,28 @@ class AVAVLA(OpenVLA):
             return rewards.new_tensor(0.0), {}
 
         latent_states = reasoning_trajectories["latent_states"]
-        next_latent_states = reasoning_trajectories["next_latent_states"]
-        stored_log_probs = reasoning_trajectories["action_log_probs"]
-        entropies = reasoning_trajectories["action_entropies"]
+        compute_dtype = _floating_parameter_dtype(
+            getattr(self, "reasoning_policy", None),
+            _floating_parameter_dtype(self.value_function, latent_states.dtype),
+        )
+        # Rollouts are compact BF16 tensors. PPO heads are deliberately FP32;
+        # replay them in the head dtype so LayerNorm/Linear kernels agree.
+        latent_states = latent_states.to(dtype=compute_dtype)
+        next_latent_states = reasoning_trajectories["next_latent_states"].to(dtype=compute_dtype)
+        stored_log_probs = reasoning_trajectories["action_log_probs"].to(dtype=compute_dtype)
+        entropies = reasoning_trajectories["action_entropies"].to(dtype=compute_dtype)
         old_log_probs = reasoning_trajectories.get("old_action_log_probs", stored_log_probs.detach())
         exit_scores = reasoning_trajectories.get("exit_scores")
 
-        rewards = rewards.to(device=latent_states.device, dtype=latent_states.dtype).view(latent_states.shape[0])
         batch_size, num_steps, _ = latent_states.shape
+        rewards = rewards.to(device=latent_states.device, dtype=latent_states.dtype)
+        if rewards.dim() == 1:
+            rewards = rewards.view(batch_size)
+        elif rewards.shape != (batch_size, num_steps):
+            raise ValueError(
+                f"Expected PPO rewards with shape {(batch_size,)} or {(batch_size, num_steps)}, "
+                f"got {tuple(rewards.shape)}"
+            )
         log_probs = stored_log_probs.to(device=latent_states.device, dtype=latent_states.dtype)
         valid_mask = reasoning_trajectories.get("valid_mask", torch.ones_like(log_probs)).to(
             device=latent_states.device,
@@ -653,6 +892,21 @@ class AVAVLA(OpenVLA):
         update_actions = reasoning_trajectories.get("update_actions")
         obs_encodings = reasoning_trajectories.get("obs_encodings")
         policy_recomputed = False
+        dynamics_recomputed = False
+        observation_recomputed = False
+        feature_names = ("primary_visual", "wrist_visual", "text", "proprio", "history")
+        feature_keys = {name: f"ppo_observation_{name}" for name in feature_names}
+        if recompute_observation and all(key in reasoning_trajectories for key in feature_keys.values()):
+            observation_features = {
+                name: reasoning_trajectories[key].to(device=latent_states.device)
+                for name, key in feature_keys.items()
+            }
+            obs_encodings = self.fuse_observation_features(observation_features)
+            initial_latent = self.initial_latent_proj(obs_encodings).to(dtype=latent_states.dtype)
+            observation_recomputed = True
+        else:
+            # Compatibility fallback for legacy/offline unit-test rollouts.
+            initial_latent = latent_states[:, 0].detach()
         if recompute_policy and update_actions is not None and obs_encodings is not None:
             update_actions = update_actions.to(device=latent_states.device, dtype=latent_states.dtype)
             if obs_encodings.dim() == 2:
@@ -661,41 +915,88 @@ class AVAVLA(OpenVLA):
                 obs_steps = obs_encodings
             obs_steps = obs_steps.to(device=latent_states.device, dtype=latent_states.dtype)
 
-            flat_policy_output = self.reasoning_policy(
-                latent_states.reshape(batch_size * num_steps, -1),
-                obs_steps.reshape(batch_size * num_steps, -1),
-            )
-            flat_log_probs, flat_entropies = self.reasoning_policy.evaluate_update_action(
-                flat_policy_output,
-                update_actions.reshape(batch_size * num_steps, -1),
-            )
-            log_probs = flat_log_probs.reshape(batch_size, num_steps).to(dtype=latent_states.dtype)
-            entropies = flat_entropies.reshape(batch_size, num_steps).to(dtype=latent_states.dtype)
+            if recompute_dynamics:
+                current_z = initial_latent
+                recomputed_states, recomputed_next_states = [], []
+                recomputed_log_probs, recomputed_entropies = [], []
+                for step in range(num_steps):
+                    recomputed_states.append(current_z)
+                    policy_output = self.reasoning_policy(current_z, obs_steps[:, step])
+                    step_log_prob, step_entropy = self.reasoning_policy.evaluate_update_action(
+                        policy_output, update_actions[:, step]
+                    )
+                    next_z = self.latent_transition(current_z, obs_steps[:, step], update_actions[:, step])
+                    recomputed_next_states.append(next_z)
+                    recomputed_log_probs.append(step_log_prob)
+                    recomputed_entropies.append(step_entropy)
+                    current_z = next_z
+                latent_states = torch.stack(recomputed_states, dim=1)
+                next_latent_states = torch.stack(recomputed_next_states, dim=1)
+                log_probs = torch.stack(recomputed_log_probs, dim=1)
+                entropies = torch.stack(recomputed_entropies, dim=1)
+                dynamics_recomputed = True
+            else:
+                flat_policy_output = self.reasoning_policy(
+                    latent_states.reshape(batch_size * num_steps, -1),
+                    obs_steps.reshape(batch_size * num_steps, -1),
+                )
+                flat_log_probs, flat_entropies = self.reasoning_policy.evaluate_update_action(
+                    flat_policy_output,
+                    update_actions.reshape(batch_size * num_steps, -1),
+                )
+                log_probs = flat_log_probs.reshape(batch_size, num_steps).to(dtype=latent_states.dtype)
+                entropies = flat_entropies.reshape(batch_size, num_steps).to(dtype=latent_states.dtype)
             policy_recomputed = True
 
-        values = self.value_function(latent_states).squeeze(-1)
+        value_dtype = _floating_parameter_dtype(self.value_function, latent_states.dtype)
+        values = self.value_function(latent_states.to(dtype=value_dtype)).squeeze(-1).to(
+            dtype=latent_states.dtype
+        )
         smoothness = (next_latent_states - latent_states).pow(2).mean(dim=-1)
 
-        task_rewards = rewards.unsqueeze(1).expand(batch_size, num_steps)
-        immediate_rewards = task_rewards - entropy_coef * entropies.detach() - smoothness_coef * smoothness.detach()
-
-        next_values = torch.cat([values[:, 1:], torch.zeros_like(values[:, :1])], dim=1)
-        next_valid_mask = torch.cat([valid_mask[:, 1:], torch.zeros_like(valid_mask[:, :1])], dim=1)
-        deltas = immediate_rewards + gamma * next_values.detach() * next_valid_mask - values.detach()
-        advantages = torch.zeros_like(values)
-        running_advantage = torch.zeros(batch_size, device=latent_states.device, dtype=latent_states.dtype)
-        for step in reversed(range(num_steps)):
-            running_advantage = deltas[:, step] + gamma * gae_lambda * running_advantage * next_valid_mask[:, step]
-            running_advantage = torch.where(
-                valid_mask[:, step].bool(),
-                running_advantage,
-                torch.zeros_like(running_advantage),
+        if rewards.dim() == 2:
+            task_rewards = rewards
+        else:
+            # A LIBERO outcome belongs to the action chunk produced after the
+            # final latent update.  Place it only on the last valid reasoning
+            # step; GAE propagates sparse credit backward instead of counting
+            # the same success reward once per latent iteration.
+            task_rewards = torch.zeros_like(values)
+            last_valid = valid_mask.sum(dim=1).long().clamp_min(1) - 1
+            task_rewards.scatter_(1, last_valid.unsqueeze(1), rewards.unsqueeze(1))
+        stored_step_rewards = reasoning_trajectories.get("ppo_step_rewards")
+        if stored_step_rewards is not None:
+            immediate_rewards = stored_step_rewards.to(device=values.device, dtype=values.dtype)
+        else:
+            immediate_rewards = (
+                task_rewards
+                - entropy_coef * entropies.detach()
+                - smoothness_coef * smoothness.detach()
             )
-            advantages[:, step] = running_advantage
-        returns = advantages + values.detach()
-        advantage_mean = (advantages * valid_mask).sum() / denom
-        advantage_var = (((advantages - advantage_mean) * valid_mask).pow(2).sum() / denom).clamp_min(1e-8)
-        advantages = (advantages - advantage_mean) / advantage_var.sqrt()
+
+        stored_advantages = reasoning_trajectories.get("ppo_advantages")
+        stored_returns = reasoning_trajectories.get("ppo_returns")
+        if stored_advantages is not None and stored_returns is not None:
+            advantages = stored_advantages.to(device=values.device, dtype=values.dtype)
+            returns = stored_returns.to(device=values.device, dtype=values.dtype)
+        else:
+            next_values = torch.cat([values[:, 1:], torch.zeros_like(values[:, :1])], dim=1)
+            next_valid_mask = torch.cat([valid_mask[:, 1:], torch.zeros_like(valid_mask[:, :1])], dim=1)
+            deltas = immediate_rewards + gamma * next_values.detach() * next_valid_mask - values.detach()
+            advantages = torch.zeros_like(values)
+            running_advantage = torch.zeros(batch_size, device=latent_states.device, dtype=latent_states.dtype)
+            for step in reversed(range(num_steps)):
+                running_advantage = deltas[:, step] + gamma * gae_lambda * running_advantage * next_valid_mask[:, step]
+                running_advantage = torch.where(
+                    valid_mask[:, step].bool(),
+                    running_advantage,
+                    torch.zeros_like(running_advantage),
+                )
+                advantages[:, step] = running_advantage
+            returns = advantages + values.detach()
+            advantage_mean = (advantages * valid_mask).sum() / denom
+            advantage_var = (((advantages - advantage_mean) * valid_mask).pow(2).sum() / denom).clamp_min(1e-8)
+            advantages = (advantages - advantage_mean) / advantage_var.sqrt()
 
         ratio = torch.exp((log_probs - old_log_probs).clamp(-20.0, 20.0))
         unclipped_policy = ratio * advantages.detach()
@@ -704,15 +1005,19 @@ class AVAVLA(OpenVLA):
         value_loss = (((values - returns.detach()).pow(2)) * valid_mask).sum() / denom
         entropy_penalty = (entropies * valid_mask).sum() / denom
         smoothness_loss = (smoothness * valid_mask).sum() / denom
-        if recompute_policy:
-            exit_scores = self.exit_gate(next_latent_states.reshape(batch_size * num_steps, -1)).reshape(
-                batch_size,
-                num_steps,
+        if train_exit_gate and recompute_policy:
+            exit_dtype = _floating_parameter_dtype(self.exit_gate, latent_states.dtype)
+            exit_scores = self.exit_gate(
+                next_latent_states.reshape(batch_size * num_steps, -1).to(dtype=exit_dtype)
+            ).reshape(batch_size, num_steps).to(
+                dtype=latent_states.dtype
             )
-        if exit_scores is not None and exit_scores.numel() > 0:
+        if train_exit_gate and exit_scores is not None and exit_scores.numel() > 0:
             exit_scores = exit_scores.to(device=latent_states.device, dtype=latent_states.dtype)
             if exit_targets is None:
-                exit_target_tensor = rewards.detach().clamp(0.0, 1.0)
+                exit_target_tensor = (
+                    rewards[:, -1] if rewards.dim() == 2 else rewards
+                ).detach().clamp(0.0, 1.0)
             else:
                 exit_target_tensor = exit_targets.to(device=latent_states.device, dtype=latent_states.dtype).view(batch_size)
             exit_target_tensor = exit_target_tensor.unsqueeze(1).expand_as(exit_scores)
@@ -725,8 +1030,10 @@ class AVAVLA(OpenVLA):
         else:
             exit_loss = latent_states.new_tensor(0.0)
 
-        # Entropy and smoothness are already part of the composite reward above; adding them again here would
-        # silently change the meaning of lambda_1/lambda_2.
+        # Appendix B.3 defines entropy and smoothness inside the composite
+        # reward used by GAE.  Do not add them a second time as direct losses.
+        # Stage 2 already provides the explicit differentiable smoothness
+        # warmup; Stage 3 optimizes the frozen composite-reward targets once.
         rl_loss = policy_loss + value_coef * value_loss + exit_loss_coef * exit_loss
 
         return rl_loss, {
@@ -742,9 +1049,75 @@ class AVAVLA(OpenVLA):
                 .cpu()
             ),
             "ppo_policy_recomputed": float(policy_recomputed),
+            "ppo_dynamics_recomputed": float(dynamics_recomputed),
+            "ppo_observation_recomputed": float(observation_recomputed),
+            "regularizers_in_reward_only": 1.0,
             "gae_advantage_mean": float(((advantages * valid_mask).sum() / denom).detach().cpu()),
             "mean_composite_reward": float(((immediate_rewards * valid_mask).sum() / denom).detach().cpu()),
             "total_rl_loss": float(rl_loss.detach().cpu()),
+        }
+
+    def compute_latent_warmup_loss(self, reasoning_trajectories: Dict) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Stage-2 smoothness objective with gradients into policy and transition dynamics."""
+        latent_states = reasoning_trajectories["latent_states"]
+        next_latent_states = reasoning_trajectories["next_latent_states"]
+        valid_mask = reasoning_trajectories.get(
+            "valid_mask", latent_states.new_ones(latent_states.shape[:2])
+        ).to(dtype=latent_states.dtype)
+        denom = valid_mask.sum().clamp_min(1.0)
+        per_step = (next_latent_states - latent_states).pow(2).mean(dim=-1)
+        loss = (per_step * valid_mask).sum() / denom
+        return loss, {
+            "latent_warmup_loss": float(loss.detach().cpu()),
+            "latent_distance_mean": float((per_step * valid_mask).sum().detach().cpu() / denom.detach().cpu()),
+        }
+
+    def compute_exit_calibration_loss(
+        self,
+        reasoning_trajectories: Dict,
+        lookahead: int = 3,
+        delta: float = 0.05,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Calibrate g_omega after PPO using critic-estimated value of computation.
+
+        A state is a positive exit example when continuing for ``lookahead``
+        latent steps improves the learned task value by less than ``delta``.
+        All policy, transition, and critic inputs are detached so only the exit
+        gate receives gradients during stage 4.
+        """
+        raw_states = reasoning_trajectories["next_latent_states"].detach()
+        exit_dtype = _floating_parameter_dtype(self.exit_gate, raw_states.dtype)
+        states = raw_states.to(dtype=exit_dtype)
+        batch_size, num_steps, latent_dim = states.shape
+        valid_mask = reasoning_trajectories.get(
+            "valid_mask", states.new_ones(batch_size, num_steps)
+        ).to(dtype=states.dtype)
+        with torch.no_grad():
+            value_dtype = _floating_parameter_dtype(self.value_function, states.dtype)
+            values = self.value_function(
+                states.reshape(batch_size * num_steps, latent_dim).to(dtype=value_dtype)
+            ).reshape(batch_size, num_steps).to(dtype=states.dtype)
+            labels = torch.zeros_like(values)
+            for step in range(num_steps):
+                future_step = min(step + max(1, int(lookahead)), num_steps - 1)
+                improvement = values[:, future_step] - values[:, step]
+                labels[:, step] = (improvement < float(delta)).to(dtype=values.dtype)
+
+        scores = self.exit_gate(states.reshape(batch_size * num_steps, latent_dim)).reshape(
+            batch_size, num_steps
+        )
+        per_step_loss = F.binary_cross_entropy(
+            scores.clamp(1e-6, 1.0 - 1e-6), labels, reduction="none"
+        )
+        denom = valid_mask.sum().clamp_min(1.0)
+        loss = (per_step_loss * valid_mask).sum() / denom
+        accuracy = (
+            ((scores >= 0.5) == labels.bool()).to(dtype=valid_mask.dtype) * valid_mask
+        ).sum() / denom
+        return loss, {
+            "exit_calibration_loss": float(loss.detach().cpu()),
+            "exit_calibration_accuracy": float(accuracy.detach().cpu()),
+            "exit_positive_rate": float(((labels * valid_mask).sum() / denom).detach().cpu()),
         }
 
     def _fuse_latent_into_embeddings(
@@ -788,16 +1161,69 @@ class AVAVLA(OpenVLA):
         multimodal_indices: Optional[torch.LongTensor] = None,
         latent_state: Optional[torch.Tensor] = None,
         zero_action_token_embeddings: bool = False,
+        initialize_latent_from_observation: bool = False,
+        pixel_values_wrist: Optional[torch.FloatTensor | Dict[str, torch.Tensor]] = None,
+        proprio: Optional[torch.Tensor] = None,
+        history_states: Optional[torch.Tensor] = None,
+        training_objective: Optional[str] = None,
+        reasoning_trajectories: Optional[Dict] = None,
+        rl_rewards: Optional[torch.Tensor] = None,
+        objective_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         """Forward pass, optionally injecting finalized latent reasoning state into action generation."""
+        objective_kwargs = objective_kwargs or {}
+        if training_objective == "latent_warmup":
+            obs_encoding = self.encode_observation(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                history_states=history_states,
+                pixel_values_wrist=pixel_values_wrist,
+                proprio=proprio,
+                labels=labels,
+            )
+            initial_z = self.initial_latent_proj(obs_encoding)
+            _, _, trajectories = self.latent_reasoning_forward(
+                initial_z,
+                obs_encoding,
+                num_steps=objective_kwargs.get("num_steps", self.max_reasoning_steps),
+                training=True,
+                return_trajectory=True,
+            )
+            loss, metrics = self.compute_latent_warmup_loss(trajectories)
+            return loss, metrics, trajectories
+        if training_objective == "ppo":
+            if reasoning_trajectories is None or rl_rewards is None:
+                raise ValueError("PPO forward requires reasoning_trajectories and rl_rewards")
+            return self.compute_rl_loss(reasoning_trajectories, rl_rewards, **objective_kwargs)
+        if training_objective == "exit_calibration":
+            if reasoning_trajectories is None:
+                raise ValueError("Exit calibration requires reasoning_trajectories")
+            return self.compute_exit_calibration_loss(reasoning_trajectories, **objective_kwargs)
+
         # Drop HF-OpenVLA-only kwargs if this local PrismaticVLM wrapper is used by AVA-VLA scripts.
-        kwargs.pop("proprio", None)
         kwargs.pop("proprio_projector", None)
         kwargs.pop("noisy_actions", None)
         kwargs.pop("noisy_action_projector", None)
         kwargs.pop("diffusion_timestep_embeddings", None)
         kwargs.pop("use_film", None)
+
+        if initialize_latent_from_observation:
+            if not self.enable_latent_reasoning:
+                raise ValueError("Initial multimodal latent conditioning requires latent reasoning to be enabled.")
+            if latent_state is not None:
+                raise ValueError("Pass either latent_state or initialize_latent_from_observation, not both.")
+            obs_encoding = self.encode_observation(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                history_states=history_states,
+                pixel_values_wrist=pixel_values_wrist,
+                proprio=proprio,
+                labels=labels,
+            )
+            latent_state = self.initial_latent_proj(obs_encoding)
 
         if (latent_state is None or not self.enable_latent_reasoning) and not zero_action_token_embeddings:
             return super().forward(
@@ -993,11 +1419,14 @@ class AVAVLA(OpenVLA):
         self,
         image: Image.Image,
         instruction: str,
+        wrist_image: Optional[Image.Image] = None,
+        proprio: Optional[np.ndarray] = None,
         unnorm_key: Optional[str] = None,
         num_reasoning_steps: Optional[int] = None,
         return_reasoning_info: bool = False,
         history_states: Optional[torch.Tensor] = None,
         update_history: bool = True,
+        center_crop: bool = False,
         **kwargs,
     ) -> np.ndarray | Tuple[np.ndarray, Dict]:
         """Predict an action; when latent reasoning is enabled, condition generation on the finalized z_t."""
@@ -1005,10 +1434,13 @@ class AVAVLA(OpenVLA):
             actions, info = self.predict_action_with_latent_reasoning(
                 image=image,
                 instruction=instruction,
+                wrist_image=wrist_image,
+                proprio=proprio,
                 unnorm_key=unnorm_key,
                 num_reasoning_steps=num_reasoning_steps,
                 history_states=history_states,
                 update_history=update_history,
+                center_crop=center_crop,
                 **kwargs,
             )
             return (actions, info) if return_reasoning_info else actions
@@ -1023,14 +1455,22 @@ class AVAVLA(OpenVLA):
         self,
         image: Image.Image,
         instruction: str,
+        wrist_image: Optional[Image.Image] = None,
+        proprio: Optional[np.ndarray] = None,
         unnorm_key: Optional[str] = None,
         num_reasoning_steps: Optional[int] = None,
         history_states: Optional[torch.Tensor] = None,
         update_history: bool = True,
+        center_crop: bool = False,
         **kwargs,
     ) -> Tuple[np.ndarray, Dict]:
         """Predict action and return latent-reasoning diagnostics."""
         image_transform, tokenizer = self.vision_backbone.image_transform, self.llm_backbone.tokenizer
+
+        if center_crop:
+            image = center_crop_for_augmentation(image)
+            if wrist_image is not None:
+                wrist_image = center_crop_for_augmentation(wrist_image)
 
         prompt_builder = self.get_prompt_builder()
         prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
@@ -1054,25 +1494,43 @@ class AVAVLA(OpenVLA):
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
-        history_states = self._resolve_history_state(history_states, input_ids.shape[0], input_ids.device)
-        obs_encoding = self.encode_observation(
-            pixel_values,
-            input_ids,
-            attention_mask=attention_mask,
-            history_states=history_states,
-        )
-        z_0 = self.initial_latent_proj(obs_encoding)
-        final_z, exit_scores, reasoning_info = self.latent_reasoning_forward(
-            z_0,
-            obs_encoding,
-            num_steps=num_reasoning_steps,
-            training=False,
-            return_trajectory=False,
-        )
+        pixel_values_wrist = None
+        if wrist_image is not None:
+            pixel_values_wrist = image_transform(wrist_image)
+            if isinstance(pixel_values_wrist, torch.Tensor):
+                pixel_values_wrist = pixel_values_wrist[None, ...].to(self.device)
+            elif isinstance(pixel_values_wrist, dict):
+                pixel_values_wrist = {
+                    key: value[None, ...].to(self.device) for key, value in pixel_values_wrist.items()
+                }
+            else:
+                raise ValueError(f"Unsupported wrist pixel type = {type(pixel_values_wrist)}")
+        proprio_tensor = None
+        if proprio is not None:
+            normalized_proprio = self.normalize_proprio(proprio, unnorm_key)
+            proprio_tensor = torch.as_tensor(normalized_proprio, device=self.device).reshape(1, -1)
 
         autocast_dtype = self.llm_backbone.half_precision_dtype
-        autocast_enabled = self.enable_mixed_precision_training and self.device.type == "cuda"
+        autocast_enabled = self.device.type == "cuda"
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+            history_states = self._resolve_history_state(history_states, input_ids.shape[0], input_ids.device)
+            obs_encoding = self.encode_observation(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                history_states=history_states,
+                pixel_values_wrist=pixel_values_wrist,
+                proprio=proprio_tensor,
+            )
+            z_0 = self.initial_latent_proj(obs_encoding)
+            final_z, exit_scores, reasoning_info = self.latent_reasoning_forward(
+                z_0,
+                obs_encoding,
+                num_steps=num_reasoning_steps,
+                training=False,
+                return_trajectory=False,
+                force_fixed_steps=num_reasoning_steps is not None,
+            )
             generated_ids = super(PrismaticVLM, self).generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1086,8 +1544,13 @@ class AVAVLA(OpenVLA):
         normalized_actions = self.action_tokenizer.decode_token_ids_to_actions(predicted_action_token_ids.cpu().numpy())
 
         action_norm_stats = self.get_action_stats(unnorm_key)
-        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS and "min" in action_norm_stats:
+            action_low = np.asarray(action_norm_stats["min"])
+            action_high = np.asarray(action_norm_stats["max"])
+        else:
+            action_low = np.asarray(action_norm_stats["q01"])
+            action_high = np.asarray(action_norm_stats["q99"])
+        mask = action_norm_stats.get("mask", np.ones_like(action_low, dtype=bool))
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,

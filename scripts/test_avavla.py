@@ -73,15 +73,16 @@ def test_components():
         o_t = torch.randn(batch_size, obs_dim)
         policy_output = policy(z_t, o_t)
         update_action, log_prob, entropy = policy.sample_update_action(policy_output, training=True)
-        assert policy_output["logits"].shape == (batch_size, 64)
-        assert policy_output["probs"].shape == (batch_size, 64)
+        assert policy_output["mean"].shape == (batch_size, 64)
+        assert policy_output["log_std"].shape == (batch_size, 64)
+        assert policy_output["std"].shape == (batch_size, 64)
         assert update_action.shape == (batch_size, 64)
         assert log_prob.shape == (batch_size,)
         assert entropy.shape == (batch_size,)
         assert torch.isfinite(log_prob).all()
         assert torch.isfinite(entropy).all()
-        assert torch.allclose(policy_output["probs"].sum(dim=-1), torch.ones(batch_size), atol=1e-5)
-        print(f"✓ ReasoningPolicy: Softmax logits/probs shape {policy_output['logits'].shape}")
+        assert (policy_output["std"] > 0).all()
+        print(f"✓ ReasoningPolicy: Gaussian mean/std shape {policy_output['mean'].shape}")
     except Exception as e:
         print(f"✗ ReasoningPolicy failed: {e}")
         import traceback
@@ -146,7 +147,7 @@ def test_reasoning_loop():
     latent_dim = 512
     obs_dim = 768
     max_steps = 5
-    exit_threshold = 0.8
+    exit_threshold = 0.55
     device = "cpu"
     
     try:
@@ -195,7 +196,7 @@ def test_rl_loss_computation():
     print("Testing RL loss computation...")
     print("=" * 60)
     
-    from prismatic.models.vlas.avavla import AVAVLA, ExitGate, ReasoningPolicy, ValueFunction
+    from prismatic.models.vlas.avavla import AVAVLA, ExitGate, LatentTransition, ReasoningPolicy, ValueFunction
     
     batch_size = 2
     num_steps = 3
@@ -213,6 +214,13 @@ def test_rl_loss_computation():
             update_dim=update_dim,
             num_heads=4,
             num_layers=1,
+        )
+        avavla.latent_transition = LatentTransition(
+            latent_dim=latent_dim,
+            obs_dim=obs_dim,
+            hidden_dim=64,
+            update_dim=update_dim,
+            num_heads=4,
         )
         avavla.value_function = ValueFunction(latent_dim, hidden_dim=64)
         avavla.exit_gate = ExitGate(latent_dim, hidden_dim=64)
@@ -255,8 +263,10 @@ def test_rl_loss_computation():
         print(f"  - Total RL loss: {rl_loss.item():.4f}")
         print(f"  - PPO ratio mean: {rl_info['ppo_ratio_mean']:.4f}")
         print(f"  - Policy recomputed: {rl_info['ppo_policy_recomputed']:.0f}")
+        print(f"  - Dynamics recomputed: {rl_info['ppo_dynamics_recomputed']:.0f}")
         assert torch.isfinite(rl_loss)
         assert rl_info["ppo_policy_recomputed"] == 1.0
+        assert rl_info["ppo_dynamics_recomputed"] == 1.0
         
     except Exception as e:
         print(f"✗ RL loss computation failed: {e}")
@@ -279,7 +289,8 @@ def test_file_structure():
         "vla-scripts/finetune_avavla.py",
         "vla-scripts/deploy_avavla.py",
         "scripts/evaluate_avavla.py",
-        "AVA_VLA_README.md",
+        "README.md",
+        "IMPLEMENTATION_REPRODUCTION_NOTES.md",
     ]
     
     all_exist = True

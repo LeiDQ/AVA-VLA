@@ -47,16 +47,16 @@ class AVAVLALiberoTrainConfig:
     train_samples: int = 10
     eval_samples: int = 10
     batch_size: int = 4
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     policy_lr: float = 3e-5
     critic_lr: float = 1e-4
     latent_dim: int = 128
     obs_dim: int = 128
     hidden_dim: int = 256
     update_dim: int = 32
-    reasoning_policy_type: str = "softmax"
+    reasoning_policy_type: str = "gaussian"
     reasoning_steps: int = 5
-    exit_threshold: float = 0.8
+    exit_threshold: float = 0.55
     bc_steps: int = 10
     latent_warmup_steps: int = 5
     ppo_steps: int = 10
@@ -72,7 +72,7 @@ class AVAVLALiberoTrainConfig:
     ppo_minibatch_size: int = 4
     exit_calibration_lookahead: int = 3
     exit_calibration_delta: float = 0.05
-    exit_calibration_target_rate: float = 0.5
+    exit_calibration_target_rate: Optional[float] = None
     seed: int = 7
     device: str = "cuda"
 
@@ -271,7 +271,7 @@ class LightweightAVAVLA(nn.Module):
             update_dim=cfg.update_dim,
             num_heads=4,
             num_layers=4,
-            dropout=0.05,
+            dropout=0.1,
             policy_type=cfg.reasoning_policy_type,
         )
         self.latent_transition = LatentTransition(
@@ -280,10 +280,10 @@ class LightweightAVAVLA(nn.Module):
             hidden_dim=cfg.hidden_dim,
             update_dim=cfg.update_dim,
             num_heads=4,
-            dropout=0.05,
+            dropout=0.1,
         )
-        self.exit_gate = ExitGate(cfg.latent_dim, hidden_dim=cfg.hidden_dim, dropout=0.05)
-        self.value_function = ValueFunction(cfg.latent_dim, hidden_dim=cfg.hidden_dim, dropout=0.05)
+        self.exit_gate = ExitGate(cfg.latent_dim, hidden_dim=cfg.hidden_dim, dropout=0.1)
+        self.value_function = ValueFunction(cfg.latent_dim, hidden_dim=cfg.hidden_dim, dropout=0.1)
         self.action_policy = FourLayerActionPolicy(cfg.latent_dim + cfg.obs_dim, cfg.hidden_dim, action_dim)
 
     def set_stage(self, stage: str) -> None:
@@ -331,7 +331,7 @@ class LightweightAVAVLA(nn.Module):
         groups = [group for group in groups if group["params"]]
         if not groups:
             raise RuntimeError("No trainable parameters for the selected stage")
-        return torch.optim.AdamW(groups)
+        return torch.optim.Adam(groups, betas=(0.9, 0.999), eps=1e-8)
 
     def forward(
         self,
@@ -740,9 +740,13 @@ def calibrate_exit_threshold(
     model: LightweightAVAVLA,
     samples: List[Dict[str, Any]],
     device: torch.device,
-    target_rate: float,
+    target_rate: Optional[float],
     logger: logging.Logger,
 ) -> float:
+    if target_rate is None:
+        logger.info("Keeping paper-calibrated exit_threshold=%.2f", model.cfg.exit_threshold)
+        return model.cfg.exit_threshold
+
     model.eval()
     scores: List[float] = []
     with torch.no_grad():
@@ -775,8 +779,8 @@ def main() -> None:
     parser.add_argument("--train-samples", type=int, default=10)
     parser.add_argument("--eval-samples", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--reasoning-policy-type", choices=["softmax", "gaussian"], default="softmax")
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--reasoning-policy-type", choices=["softmax", "gaussian"], default="gaussian")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--bc-steps", type=int, default=10)
     parser.add_argument("--latent-warmup-steps", type=int, default=5)
@@ -784,7 +788,12 @@ def main() -> None:
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--ppo-minibatch-size", type=int, default=4)
     parser.add_argument("--exit-calibration-steps", type=int, default=5)
-    parser.add_argument("--exit-calibration-target-rate", type=float, default=0.5)
+    parser.add_argument(
+        "--exit-calibration-target-rate",
+        type=float,
+        default=None,
+        help="Optional smoke-test quantile calibration; omitted by default to keep the paper threshold 0.55",
+    )
     parser.add_argument("--iterations", type=int, default=None, help="Backward-compatible alias for --ppo-steps")
     args = parser.parse_args()
 

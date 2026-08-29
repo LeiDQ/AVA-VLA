@@ -32,7 +32,7 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 # Model image size configuration
 MODEL_IMAGE_SIZES = {
     "openvla": 224,
-    "avavla": 224,
+    "avavla": 384,
     # Add other models as needed
 }
 
@@ -156,16 +156,34 @@ def get_action(
             )
         elif cfg.model_family == "avavla":
             image = Image.fromarray(obs["full_image"]).convert("RGB")
+            if torch.cuda.is_available() and str(DEVICE).startswith("cuda"):
+                torch.cuda.synchronize()
+            query_start = time.perf_counter()
             actions, reasoning_info = predict_avavla_action(
                 model=model,
                 processor=None,
                 image=image,
                 instruction=task_label,
+                wrist_image=Image.fromarray(obs["wrist_image"]).convert("RGB"),
+                proprio=np.asarray(obs["state"], dtype=np.float32),
                 unnorm_key=cfg.unnorm_key,
                 num_reasoning_steps=getattr(cfg, "fixed_reasoning_steps", None),
                 device=str(DEVICE),
                 update_history=getattr(cfg, "use_history_state", True),
+                center_crop=getattr(cfg, "center_crop", False),
             )
+            if torch.cuda.is_available() and str(DEVICE).startswith("cuda"):
+                torch.cuda.synchronize()
+            telemetry = getattr(cfg, "_reasoning_telemetry", None)
+            if telemetry is not None:
+                telemetry.append(
+                    {
+                        "latency_ms": (time.perf_counter() - query_start) * 1000.0,
+                        "reasoning_steps": float(
+                            np.asarray(reasoning_info.get("num_steps_performed", 0)).mean()
+                        ),
+                    }
+                )
             if getattr(cfg, "log_reasoning_info", False):
                 print(
                     "AVA-VLA reasoning: "

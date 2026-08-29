@@ -138,14 +138,18 @@ class PaddedCollatorForActionPrediction:
         assert all([pv is not None for pv in pixel_values]), "Invalid VLA Example with `pixel_values = None`!"
 
         # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
+        pixel_values_wrist = None
         if isinstance(pixel_values[0], torch.Tensor):
+            pixel_values = torch.stack(pixel_values)
             if "pixel_values_wrist" in instances[0]:
-                pixel_values_wrist = [instance["pixel_values_wrist"] for instance in instances]
-                pixel_values = torch.cat((torch.stack(pixel_values), torch.stack(pixel_values_wrist)), dim=1)
-            else:
-                pixel_values = torch.stack(pixel_values)
+                pixel_values_wrist = torch.stack([instance["pixel_values_wrist"] for instance in instances])
         elif isinstance(pixel_values[0], dict):
             pixel_values = {k: torch.stack([pv[k] for pv in pixel_values]) for k in pixel_values[0]}
+            if "pixel_values_wrist" in instances[0]:
+                pixel_values_wrist = {
+                    k: torch.stack([instance["pixel_values_wrist"][k] for instance in instances])
+                    for k in instances[0]["pixel_values_wrist"]
+                }
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
@@ -155,8 +159,7 @@ class PaddedCollatorForActionPrediction:
 
         # Stack proprio
         if "proprio" in instances[0]:
-            proprio = [instance["proprio"] for instance in instances]
-            proprio = torch.Tensor(np.squeeze(np.stack(proprio)))
+            proprio = torch.as_tensor(np.stack([instance["proprio"] for instance in instances]), dtype=torch.float32)
         else:
             proprio = None
 
@@ -168,6 +171,35 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
         )
+        if pixel_values_wrist is not None:
+            output["pixel_values_wrist"] = pixel_values_wrist
+        if "pixel_values_history" in instances[0]:
+            history_pixels = [instance["pixel_values_history"] for instance in instances]
+            if isinstance(history_pixels[0], torch.Tensor):
+                output["pixel_values_history"] = torch.stack(history_pixels)
+            else:
+                output["pixel_values_history"] = {
+                    key: torch.stack([value[key] for value in history_pixels])
+                    for key in history_pixels[0]
+                }
+            output["history_pad_mask"] = torch.as_tensor(
+                [bool(instance["history_pad_mask"]) for instance in instances],
+                dtype=torch.bool,
+            )
+            if "proprio_history" in instances[0]:
+                output["proprio_history"] = torch.as_tensor(
+                    np.stack([instance["proprio_history"] for instance in instances]),
+                    dtype=torch.float32,
+                )
+            if "pixel_values_wrist_history" in instances[0]:
+                wrist_history = [instance["pixel_values_wrist_history"] for instance in instances]
+                if isinstance(wrist_history[0], torch.Tensor):
+                    output["pixel_values_wrist_history"] = torch.stack(wrist_history)
+                else:
+                    output["pixel_values_wrist_history"] = {
+                        key: torch.stack([value[key] for value in wrist_history])
+                        for key in wrist_history[0]
+                    }
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         if "history_states" in instances[0]:

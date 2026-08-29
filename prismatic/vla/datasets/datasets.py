@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from transformers import PreTrainedTokenizerBase
 
 from prismatic.models.backbones.llm.prompting import PromptBuilder
@@ -40,44 +41,44 @@ class RLDSBatchTransform:
         dataset_name = rlds_batch["dataset_name"]
         actions = rlds_batch["action"]
         current_action_idx = max(0, actions.shape[0] - NUM_ACTIONS_CHUNK)
-        current_action = actions[current_action_idx]
+        action_chunk = actions[current_action_idx : current_action_idx + NUM_ACTIONS_CHUNK]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
+        # Tokenize the prompt separately and append action IDs directly. Decoding action IDs to text and
+        # retokenizing can merge SentencePiece tokens, silently producing fewer than 8 * 7 action positions.
         prompt_builder = self.prompt_builder_fn("openvla")
+        prompt_builder.add_turn(
+            role="human",
+            message=f"What action should the robot take to {lang}?",
+        )
+        prompt_ids = torch.tensor(
+            self.base_tokenizer(
+                prompt_builder.get_prompt(),
+                add_special_tokens=True,
+            ).input_ids,
+            dtype=torch.long,
+        )
+        if prompt_ids[-1].item() != 29871:
+            prompt_ids = torch.cat([prompt_ids, prompt_ids.new_tensor([29871])])
 
-        # Get future action chunk
-        future_actions = actions[current_action_idx + 1 :]
-        future_actions_string = ''.join(self.action_tokenizer(future_actions))
-
-        # Get action chunk string
-        current_action_string = self.action_tokenizer(current_action)
-        action_chunk_string = current_action_string + future_actions_string
-        action_chunk_len = len(action_chunk_string)
-
-        conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": action_chunk_string},
-        ]
-        for turn in conversation:
-            prompt_builder.add_turn(turn["from"], turn["value"])
-
-        # Tokenize (w/ `base_tokenizer`)
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
-        labels = list(input_ids)
-
-        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+        action_token_ids = torch.as_tensor(
+            self.action_tokenizer.encode_actions_to_token_ids(action_chunk),
+            dtype=torch.long,
+        ).reshape(-1)
+        stop_token = torch.tensor([STOP_INDEX], dtype=torch.long)
+        input_ids = torch.cat([prompt_ids, action_token_ids, stop_token])
+        labels = torch.cat(
+            [
+                torch.full_like(prompt_ids, IGNORE_INDEX),
+                action_token_ids.clone(),
+                stop_token.clone(),
+            ],
+        )
         pixel_values = self.image_transform(img)
-
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        action_chunk = actions[current_action_idx : current_action_idx + NUM_ACTIONS_CHUNK]
         return_dict = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -86,16 +87,25 @@ class RLDSBatchTransform:
             actions=action_chunk,
         )
 
-        history_actions = actions[:current_action_idx]
-        history_parts = [history_actions]
-        if current_action_idx > 0 and "proprio" in rlds_batch["observation"]:
-            history_proprio = rlds_batch["observation"]["proprio"][:current_action_idx]
-            history_parts.append(history_proprio)
-        if current_action_idx > 0:
-            return_dict["history_states"] = np.concatenate(history_parts, axis=-1).astype(np.float32)
-            return_dict["history_pad_mask"] = rlds_batch["observation"].get(
-                "pad_mask", np.ones(current_action_idx, dtype=bool)
-            )[:current_action_idx].astype(bool)
+        # Online execution consumes one full action chunk before the next
+        # policy query.  Retain the observation exactly NUM_ACTIONS_CHUNK
+        # control steps back so BC/warmup and online inference share the same
+        # cross-decision history interval.
+        observation = rlds_batch["observation"]
+        history_index = -(NUM_ACTIONS_CHUNK + 1)
+        if observation["image_primary"].shape[0] > NUM_ACTIONS_CHUNK:
+            return_dict["pixel_values_history"] = self.image_transform(
+                Image.fromarray(observation["image_primary"][history_index])
+            )
+            return_dict["history_pad_mask"] = np.asarray(
+                observation.get(
+                    "pad_mask",
+                    np.ones(observation["image_primary"].shape[0], dtype=bool),
+                )[history_index],
+                dtype=bool,
+            )
+            if self.use_proprio and "proprio" in observation:
+                return_dict["proprio_history"] = observation["proprio"][history_index].astype(np.float32)
 
         for key in ("reward", "success"):
             if key in rlds_batch:
@@ -105,16 +115,19 @@ class RLDSBatchTransform:
 
         # Add additional inputs
         if self.use_wrist_image:
-            all_wrist_pixels = []
-            for k in rlds_batch["observation"].keys():
-                if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][-1])
-                    pixel_values_wrist = self.image_transform(img_wrist)
-                    all_wrist_pixels.append(pixel_values_wrist)
-            return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+            wrist_keys = sorted(k for k in rlds_batch["observation"] if "wrist" in k)
+            if wrist_keys:
+                # Keep the wrist view separate for both tensor and DINO+SigLIP transforms.
+                img_wrist = Image.fromarray(rlds_batch["observation"][wrist_keys[0]][-1])
+                return_dict["pixel_values_wrist"] = self.image_transform(img_wrist)
+                if rlds_batch["observation"][wrist_keys[0]].shape[0] > NUM_ACTIONS_CHUNK:
+                    return_dict["pixel_values_wrist_history"] = self.image_transform(
+                        Image.fromarray(
+                            rlds_batch["observation"][wrist_keys[0]][history_index]
+                        )
+                    )
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
-            proprio = rlds_batch["observation"]["proprio"][-1]
-            return_dict["proprio"] = proprio
+            return_dict["proprio"] = rlds_batch["observation"]["proprio"][-1].astype(np.float32)
 
         return return_dict
 
@@ -130,9 +143,11 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        seed: int = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+        self.seed = int(seed)
 
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
@@ -169,6 +184,7 @@ class RLDSDataset(IterableDataset):
             ),
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
+            seed=self.seed,
             sample_weights=weights,
             balance_weights=True,
             traj_transform_threads=len(mixture_spec),
@@ -201,7 +217,17 @@ class RLDSDataset(IterableDataset):
         return make_interleaved_dataset(**rlds_config)
 
     def __iter__(self) -> Dict[str, Any]:
-        for rlds_batch in self.dataset.as_numpy_iterator():
+        dataset = self.dataset
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        worker = get_worker_info()
+        workers_per_rank = worker.num_workers if worker is not None else 1
+        worker_id = worker.id if worker is not None else 0
+        num_shards = world_size * workers_per_rank
+        shard_index = rank * workers_per_rank + worker_id
+        if num_shards > 1:
+            dataset = dataset.shard(num_shards, shard_index)
+        for rlds_batch in dataset.as_numpy_iterator():
             yield self.batch_transform(rlds_batch)
 
     def __len__(self) -> int:
