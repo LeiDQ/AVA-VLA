@@ -344,7 +344,11 @@ LIBERO evaluation uses 10 tasks, 50 trials per task, center crop, proprioception
 
 Each resumable checkpoint contains a `CHECKPOINT_COMPLETE.json` manifest. The manifest records all required components and their byte sizes so interrupted or partially copied checkpoints are not resumed as complete runs.
 
-BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The training launchers validate and resume compatible checkpoints automatically. `SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
+BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The latest checkpoint remains the automatic interruption-recovery point.
+
+The completed BC, latent-warmup, online-PPO, and final exit-calibration states are also retained under `stage_checkpoints/`. These archives use hard links when the filesystem permits, validate their stage counters, and remain independently loadable after later checkpoints rotate. The completed online-PPO archive includes the per-rank calibration buffers required to continue directly into exit calibration. At the end of training, the launcher writes a cross-stage validation report to `stage_checkpoints/STAGE_VALIDATION.json`; it verifies the checkpoint manifests and the stage-specific parameter-freezing contracts.
+
+`SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
 
 For a manual distributed resume, keep all experiment arguments identical to the original run:
 

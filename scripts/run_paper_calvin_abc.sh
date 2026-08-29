@@ -90,6 +90,9 @@ if [[ ! -f "$RUN_DIR/TRAINING_COMPLETE" ]]; then
         --use_wandb false >>"$TRAIN_LOG" 2>&1
 fi
 
+"$PYTHON" "$ROOT/scripts/validate_avavla_stage_checkpoints.py" \
+    "$RUN_DIR" --write-report >>"$TRAIN_LOG" 2>&1
+
 shard_dir="$RESULT_ROOT/$RUN_ID/shards"
 mkdir -p "$shard_dir"
 pids=()

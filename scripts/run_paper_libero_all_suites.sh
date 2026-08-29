@@ -178,6 +178,10 @@ for seed in $PAPER_SEEDS; do
         exit 4
     fi
 
+    "$PYTHON" "$ROOT/scripts/validate_avavla_stage_checkpoints.py" \
+        "$run_dir" --write-report >>"$train_log" 2>&1
+    status "stage_checkpoints_validated policy=all_four_suites seed=$seed run=$run_id"
+
     status "evaluation_start policy=all_four_suites seed=$seed checkpoint=$run_dir"
     "$PYTHON" "$ROOT/scripts/evaluate_libero_checkpoint_all_suites.py" \
         --checkpoint "$run_dir" \

@@ -75,6 +75,10 @@ def main() -> int:
         save_latest_checkpoint_only=True,
         use_l1_regression=True,
         enable_latent_reasoning=True,
+        bc_steps=17,
+        latent_warmup_steps=0,
+        ppo_environment_steps=100,
+        exit_calibration_steps=2,
     )
     model = SimpleNamespace(module=_FakeAVA())
     action_module = nn.Linear(2, 2)
@@ -96,8 +100,17 @@ def main() -> int:
         scheduler,
         distributed_state,
         avavla_config,
-        {"stage": "bc"},
+        {"stage": "bc_complete", "log_step": 17, "stage_step": 17},
     )
+    torch.save(
+        [{
+            "ppo_rewards": torch.ones(2),
+            "next_latent_states": torch.ones(2, 3, 4),
+            "valid_mask": torch.ones(2, 3),
+        }],
+        run_dir / f"exit_calibration_buffer_rank{rank}.pt",
+    )
+    dist.barrier()
     if rank == 0:
         torch.save({"partial": True}, run_dir / "avavla--step-999-crash_checkpoint.pt")
     dist.barrier()
@@ -113,7 +126,12 @@ def main() -> int:
         scheduler,
         distributed_state,
         avavla_config,
-        {"stage": "ppo"},
+        {
+            "stage": "online_ppo_complete",
+            "log_step": 18,
+            "global_env_steps": 100,
+            "ppo_update": 1,
+        },
     )
 
     rank_sum = torch.tensor(float(rank), device=torch.device("cuda", local_rank))
@@ -126,12 +144,22 @@ def main() -> int:
         assert manifest["log_step"] == 18
         required = set(manifest["required_files"])
         assert len([name for name in required if name.startswith("rng_state_rank")]) == 8
-        assert all("step-18-ppo" in name for name in required if "--step-" in name)
+        assert all("step-18-online_ppo_complete" in name for name in required if "--step-" in name)
+        assert len([name for name in required if name.startswith("exit_calibration_buffer_rank")]) == 8
+        bc_archive = run_dir / "stage_checkpoints" / "bc_complete"
+        ppo_archive = run_dir / "stage_checkpoints" / "online_ppo_complete"
+        assert finetune._validate_checkpoint_manifest(bc_archive)["stage"] == "bc_complete"
+        archived_ppo = finetune._validate_checkpoint_manifest(ppo_archive)
+        assert archived_ppo["stage"] == "online_ppo_complete"
+        assert len([
+            name for name in archived_ppo["required_files"]
+            if name.startswith("exit_calibration_buffer_rank")
+        ]) == 8
         leftovers = [
             path.name
             for path in run_dir.iterdir()
             if path.name.startswith(("action_head--", "avavla--", "training_state--", "rng_state_rank"))
-            and "step-18-ppo" not in path.name
+            and "step-18-online_ppo_complete" not in path.name
         ]
         assert not leftovers, leftovers
         print("PASS: 8-GPU NCCL and two-generation atomic checkpoint contract")

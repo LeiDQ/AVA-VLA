@@ -60,6 +60,12 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 CHECKPOINT_IMPLEMENTATION_VERSION = 9
+COMPLETED_STAGE_NAMES = (
+    "bc_complete",
+    "latent_warmup_complete",
+    "online_ppo_complete",
+    "complete",
+)
 
 
 @dataclass
@@ -1309,27 +1315,85 @@ def _link_or_copy_base_checkpoint(source: Path, destination: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _archive_bc_complete_checkpoint(checkpoint_dir: Path, manifest: Dict) -> Optional[Path]:
-    """Keep an independently loadable BC snapshot when latest-only rotation is enabled.
+def _validate_completed_stage_metadata(cfg, manifest: Dict, paper_state: Dict) -> Dict[str, bool]:
+    """Validate counters that make a completed-stage checkpoint safe to resume."""
+    stage = str(manifest.get("stage", ""))
+    if stage not in COMPLETED_STAGE_NAMES:
+        return {}
+
+    log_step = int(manifest.get("log_step", -1))
+    if str(paper_state.get("stage", "")) != stage:
+        raise RuntimeError(
+            f"Completed-stage manifest/training-state mismatch: {stage=} "
+            f"paper_state.stage={paper_state.get('stage')!r}"
+        )
+    if int(paper_state.get("log_step", -2)) != log_step:
+        raise RuntimeError(
+            f"Completed-stage log-step mismatch: manifest={log_step}, "
+            f"paper_state={paper_state.get('log_step')}"
+        )
+
+    checks = {
+        "manifest_matches_training_state": True,
+        "stage_counter_complete": True,
+        "global_step_consistent": True,
+    }
+    if stage == "bc_complete":
+        if int(paper_state.get("stage_step", -1)) != int(cfg.bc_steps):
+            raise RuntimeError("BC completion checkpoint does not contain the full BC step budget")
+        expected_log_step = int(cfg.bc_steps)
+    elif stage == "latent_warmup_complete":
+        if int(paper_state.get("stage_step", -1)) != int(cfg.latent_warmup_steps):
+            raise RuntimeError("Latent-warmup completion checkpoint does not contain the full warmup budget")
+        expected_log_step = int(cfg.bc_steps) + int(cfg.latent_warmup_steps)
+    else:
+        global_env_steps = int(paper_state.get("global_env_steps", -1))
+        ppo_update = int(paper_state.get("ppo_update", -1))
+        if global_env_steps < int(cfg.ppo_environment_steps) or ppo_update <= 0:
+            raise RuntimeError(
+                f"{stage} checkpoint has incomplete PPO counters: "
+                f"global_env_steps={global_env_steps}, ppo_update={ppo_update}"
+            )
+        expected_log_step = int(cfg.bc_steps) + int(cfg.latent_warmup_steps) + ppo_update
+        if stage == "complete":
+            if int(paper_state.get("stage_step", -1)) != int(cfg.exit_calibration_steps):
+                raise RuntimeError("Final checkpoint does not contain the full exit-calibration budget")
+            expected_log_step += int(cfg.exit_calibration_steps)
+
+    if log_step != expected_log_step:
+        raise RuntimeError(
+            f"Completed-stage global step is inconsistent: stage={stage}, "
+            f"actual={log_step}, expected={expected_log_step}"
+        )
+    return checks
+
+
+def _archive_completed_stage_checkpoint(
+    checkpoint_dir: Path,
+    manifest: Dict,
+    boundary_checks: Optional[Dict[str, bool]] = None,
+) -> Optional[Path]:
+    """Keep an independently loadable snapshot for every completed paper stage.
 
     The main run directory remains the resumable latest checkpoint.  Files in the
-    completed-BC generation are hard-linked into a stage-specific directory when
-    possible, so later warmup/PPO rotation can unlink the main-directory names
-    without deleting the BC weights or duplicating their storage.
+    completed generation are hard-linked into a stage-specific directory when
+    possible, so later rotation can unlink the main-directory names without
+    deleting boundary weights or duplicating the immutable base checkpoint.
     """
-    if manifest.get("stage") != "bc_complete":
+    stage = str(manifest.get("stage", ""))
+    if stage not in COMPLETED_STAGE_NAMES:
         return None
 
     checkpoint_dir = Path(checkpoint_dir)
-    archive_dir = checkpoint_dir / "stage_checkpoints" / "bc_complete"
+    archive_dir = checkpoint_dir / "stage_checkpoints" / stage
     if archive_dir.is_dir():
         archived_manifest = _validate_checkpoint_manifest(archive_dir)
         if (
-            archived_manifest.get("stage") == "bc_complete"
+            archived_manifest.get("stage") == stage
             and int(archived_manifest.get("log_step", -1)) == int(manifest.get("log_step", -2))
         ):
             return archive_dir
-        raise RuntimeError(f"Refusing to replace incompatible BC archive: {archive_dir}")
+        raise RuntimeError(f"Refusing to replace incompatible completed-stage archive: {archive_dir}")
 
     archive_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = archive_dir.with_name(f".{archive_dir.name}.tmp-{os.getpid()}")
@@ -1339,12 +1403,12 @@ def _archive_bc_complete_checkpoint(checkpoint_dir: Path, manifest: Dict) -> Opt
     try:
         required_files = manifest.get("required_files", {})
         if not isinstance(required_files, dict) or not required_files:
-            raise RuntimeError("Cannot archive BC checkpoint without required_files")
+            raise RuntimeError(f"Cannot archive {stage} checkpoint without required_files")
         for relative_name, expected_size in required_files.items():
             source = checkpoint_dir / relative_name
             if not source.is_file() or source.stat().st_size != int(expected_size):
                 raise RuntimeError(
-                    f"Cannot archive incomplete BC artifact {source}: "
+                    f"Cannot archive incomplete {stage} artifact {source}: "
                     f"size={source.stat().st_size if source.is_file() else -1}, expected={expected_size}"
                 )
             _link_or_copy_base_checkpoint(source, temporary_dir / relative_name)
@@ -1352,9 +1416,10 @@ def _archive_bc_complete_checkpoint(checkpoint_dir: Path, manifest: Dict) -> Opt
         _atomic_write_json(manifest, temporary_dir / "CHECKPOINT_COMPLETE.json")
         _atomic_write_json(
             {
-                "stage": "bc_complete",
+                "stage": stage,
                 "log_step": int(manifest["log_step"]),
-                "recommended_max_reasoning_steps": 0,
+                "independently_resumable": True,
+                "boundary_checks": dict(boundary_checks or {}),
                 "source_checkpoint_dir": str(checkpoint_dir.resolve()),
             },
             temporary_dir / "STAGE_CHECKPOINT.json",
@@ -1365,6 +1430,17 @@ def _archive_bc_complete_checkpoint(checkpoint_dir: Path, manifest: Dict) -> Opt
         if temporary_dir.exists():
             shutil.rmtree(temporary_dir)
     return archive_dir
+
+
+def _restore_stage_artifact_for_resume(cfg, run_dir: Path, artifact_name: str) -> Path:
+    """Materialize a stage-local artifact when resuming from an archived checkpoint."""
+    destination = Path(run_dir) / artifact_name
+    if destination.is_file() or not cfg.resume:
+        return destination
+    source = _component_root(Path(cfg.vla_path)) / artifact_name
+    if source.is_file():
+        _link_or_copy_base_checkpoint(source, destination)
+    return destination
 
 
 def _validate_checkpoint_manifest(root: Path) -> Dict:
@@ -1858,6 +1934,14 @@ def save_training_checkpoint(
             checkpoint_dir / f"rng_state_rank{rank_index}--{checkpoint_name_suffix}"
             for rank_index in range(int(distributed_state.num_processes))
         )
+        if stage_name == "online_ppo_complete":
+            # Stage 4 trains from compact PPO trajectories rather than fresh
+            # environment interaction.  Include every rank's buffer so this
+            # boundary is independently resumable, not merely evaluable.
+            required_paths.extend(
+                checkpoint_dir / f"exit_calibration_buffer_rank{rank_index}.pt"
+                for rank_index in range(int(distributed_state.num_processes))
+            )
         missing = [str(path) for path in required_paths if not path.is_file() or path.stat().st_size <= 0]
         if missing:
             raise RuntimeError(f"Refusing to publish incomplete checkpoint manifest; missing={missing}")
@@ -1870,11 +1954,23 @@ def save_training_checkpoint(
                 for path in required_paths
             },
         }
+        boundary_checks = _validate_completed_stage_metadata(
+            cfg,
+            checkpoint_manifest,
+            dict(paper_state or {}),
+        )
         _atomic_write_json(checkpoint_manifest, checkpoint_dir / "CHECKPOINT_COMPLETE.json")
         if cfg.save_latest_checkpoint_only:
-            archived_bc_dir = _archive_bc_complete_checkpoint(checkpoint_dir, checkpoint_manifest)
-            if archived_bc_dir is not None:
-                print(f"Preserved completed BC checkpoint at {archived_bc_dir}", flush=True)
+            archived_stage_dir = _archive_completed_stage_checkpoint(
+                checkpoint_dir,
+                checkpoint_manifest,
+                boundary_checks,
+            )
+            if archived_stage_dir is not None:
+                print(
+                    f"Preserved completed stage checkpoint at {archived_stage_dir}",
+                    flush=True,
+                )
             current_required_files = {
                 str(path.relative_to(checkpoint_dir)) for path in required_paths
             }
@@ -2382,8 +2478,10 @@ def execute_paper_training(
 
         last_rollout = None
         calibration_rollouts = deque(maxlen=max(1, cfg.exit_calibration_buffer_rollouts))
-        calibration_buffer_path = run_dir / (
-            f"exit_calibration_buffer_rank{distributed_state.process_index}.pt"
+        calibration_buffer_path = _restore_stage_artifact_for_resume(
+            cfg,
+            run_dir,
+            f"exit_calibration_buffer_rank{distributed_state.process_index}.pt",
         )
         if cfg.resume and calibration_buffer_path.exists():
             saved_rollouts = torch.load(calibration_buffer_path, map_location=device_id)

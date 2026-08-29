@@ -310,6 +310,13 @@ for seed in $PAPER_SEEDS; do
             sleep 60
         done
 
+        if ! "$PYTHON" "$ROOT/scripts/validate_avavla_stage_checkpoints.py" \
+            "$run_dir" --write-report >>"$train_log" 2>&1; then
+            status "stage_checkpoint_validation_failed suite=$suite seed=$seed run=$run_id"
+            exit 5
+        fi
+        status "stage_checkpoints_validated suite=$suite seed=$seed run=$run_id"
+
         curve_dir="$RESULT_ROOT/$suite/seed${seed}/training_curves"
         if "$PYTHON" "$ROOT/scripts/plot_avavla_losses.py" \
             "$run_dir/metrics.jsonl" --output-dir "$curve_dir" \
