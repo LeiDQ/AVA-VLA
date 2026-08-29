@@ -274,6 +274,50 @@ def test_atomic_checkpoint_and_resume_step_contract() -> None:
         assert linked_base.read_bytes() == source_base.read_bytes()
 
 
+def test_bc_complete_archive_survives_latest_rotation() -> None:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        root = Path(temporary_directory)
+        artifacts = {
+            "config.json": b"config",
+            "dataset_statistics.json": b"stats",
+            "avavla_config.json": b"ava-config",
+            "checkpoints/latest-checkpoint.pt": b"immutable-base",
+            "action_head--step-100000-bc_complete_checkpoint.pt": b"action-head",
+            "avavla--step-100000-bc_complete_checkpoint.pt": b"ava-components",
+            "training_state--step-100000-bc_complete_checkpoint.pt": b"training-state",
+            "rng_state_rank0--step-100000-bc_complete_checkpoint.pt": b"rng-state",
+        }
+        for relative_name, payload in artifacts.items():
+            path = root / relative_name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        manifest = {
+            "implementation_version": FINETUNE.CHECKPOINT_IMPLEMENTATION_VERSION,
+            "log_step": 100000,
+            "stage": "bc_complete",
+            "required_files": {
+                name: (root / name).stat().st_size for name in artifacts
+            },
+        }
+        archive = FINETUNE._archive_bc_complete_checkpoint(root, manifest)
+        assert archive == root / "stage_checkpoints" / "bc_complete"
+        archived_manifest = FINETUNE._validate_checkpoint_manifest(archive)
+        assert archived_manifest["stage"] == "bc_complete"
+        assert json.loads((archive / "STAGE_CHECKPOINT.json").read_text())["recommended_max_reasoning_steps"] == 0
+
+        archived_action = archive / "action_head--step-100000-bc_complete_checkpoint.pt"
+        assert archived_action.stat().st_ino == (
+            root / "action_head--step-100000-bc_complete_checkpoint.pt"
+        ).stat().st_ino
+        for relative_name in artifacts:
+            if Path(relative_name).name.startswith(
+                ("action_head--", "avavla--", "training_state--", "rng_state_rank")
+            ):
+                (root / relative_name).unlink()
+        assert archived_action.read_bytes() == b"action-head"
+        assert FINETUNE._archive_bc_complete_checkpoint(root, manifest) == archive
+
+
 def test_deployment_rejects_incomplete_or_legacy_checkpoint() -> None:
     with tempfile.TemporaryDirectory() as temporary_directory:
         root = Path(temporary_directory)
@@ -352,6 +396,7 @@ def main() -> int:
         test_stage3_joint_trainability,
         test_robot_action_ppo_gradient_contract,
         test_atomic_checkpoint_and_resume_step_contract,
+        test_bc_complete_archive_survives_latest_rotation,
         test_deployment_rejects_incomplete_or_legacy_checkpoint,
         test_paper_schedule_requires_latent_reasoning,
         test_ppo_checkpoint_cadence_contract,

@@ -1309,6 +1309,64 @@ def _link_or_copy_base_checkpoint(source: Path, destination: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _archive_bc_complete_checkpoint(checkpoint_dir: Path, manifest: Dict) -> Optional[Path]:
+    """Keep an independently loadable BC snapshot when latest-only rotation is enabled.
+
+    The main run directory remains the resumable latest checkpoint.  Files in the
+    completed-BC generation are hard-linked into a stage-specific directory when
+    possible, so later warmup/PPO rotation can unlink the main-directory names
+    without deleting the BC weights or duplicating their storage.
+    """
+    if manifest.get("stage") != "bc_complete":
+        return None
+
+    checkpoint_dir = Path(checkpoint_dir)
+    archive_dir = checkpoint_dir / "stage_checkpoints" / "bc_complete"
+    if archive_dir.is_dir():
+        archived_manifest = _validate_checkpoint_manifest(archive_dir)
+        if (
+            archived_manifest.get("stage") == "bc_complete"
+            and int(archived_manifest.get("log_step", -1)) == int(manifest.get("log_step", -2))
+        ):
+            return archive_dir
+        raise RuntimeError(f"Refusing to replace incompatible BC archive: {archive_dir}")
+
+    archive_dir.parent.mkdir(parents=True, exist_ok=True)
+    temporary_dir = archive_dir.with_name(f".{archive_dir.name}.tmp-{os.getpid()}")
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir)
+    temporary_dir.mkdir(parents=True)
+    try:
+        required_files = manifest.get("required_files", {})
+        if not isinstance(required_files, dict) or not required_files:
+            raise RuntimeError("Cannot archive BC checkpoint without required_files")
+        for relative_name, expected_size in required_files.items():
+            source = checkpoint_dir / relative_name
+            if not source.is_file() or source.stat().st_size != int(expected_size):
+                raise RuntimeError(
+                    f"Cannot archive incomplete BC artifact {source}: "
+                    f"size={source.stat().st_size if source.is_file() else -1}, expected={expected_size}"
+                )
+            _link_or_copy_base_checkpoint(source, temporary_dir / relative_name)
+
+        _atomic_write_json(manifest, temporary_dir / "CHECKPOINT_COMPLETE.json")
+        _atomic_write_json(
+            {
+                "stage": "bc_complete",
+                "log_step": int(manifest["log_step"]),
+                "recommended_max_reasoning_steps": 0,
+                "source_checkpoint_dir": str(checkpoint_dir.resolve()),
+            },
+            temporary_dir / "STAGE_CHECKPOINT.json",
+        )
+        _validate_checkpoint_manifest(temporary_dir)
+        os.replace(temporary_dir, archive_dir)
+    finally:
+        if temporary_dir.exists():
+            shutil.rmtree(temporary_dir)
+    return archive_dir
+
+
 def _validate_checkpoint_manifest(root: Path) -> Dict:
     """Reject partial or pre-contract checkpoints before loading any training state."""
     manifest_path = Path(root) / "CHECKPOINT_COMPLETE.json"
@@ -1803,19 +1861,20 @@ def save_training_checkpoint(
         missing = [str(path) for path in required_paths if not path.is_file() or path.stat().st_size <= 0]
         if missing:
             raise RuntimeError(f"Refusing to publish incomplete checkpoint manifest; missing={missing}")
-        _atomic_write_json(
-            {
-                "implementation_version": CHECKPOINT_IMPLEMENTATION_VERSION,
-                "log_step": int(log_step),
-                "stage": (paper_state or {}).get("stage"),
-                "required_files": {
-                    str(path.relative_to(checkpoint_dir)): int(path.stat().st_size)
-                    for path in required_paths
-                },
+        checkpoint_manifest = {
+            "implementation_version": CHECKPOINT_IMPLEMENTATION_VERSION,
+            "log_step": int(log_step),
+            "stage": (paper_state or {}).get("stage"),
+            "required_files": {
+                str(path.relative_to(checkpoint_dir)): int(path.stat().st_size)
+                for path in required_paths
             },
-            checkpoint_dir / "CHECKPOINT_COMPLETE.json",
-        )
+        }
+        _atomic_write_json(checkpoint_manifest, checkpoint_dir / "CHECKPOINT_COMPLETE.json")
         if cfg.save_latest_checkpoint_only:
+            archived_bc_dir = _archive_bc_complete_checkpoint(checkpoint_dir, checkpoint_manifest)
+            if archived_bc_dir is not None:
+                print(f"Preserved completed BC checkpoint at {archived_bc_dir}", flush=True)
             current_required_files = {
                 str(path.relative_to(checkpoint_dir)) for path in required_paths
             }
