@@ -52,7 +52,7 @@ models/
 │   ├── config.json
 │   ├── dataset_statistics.json
 │   └── checkpoints/step-295000-epoch-40-loss=0.2200.pt
-├── openvla-7b-dinosiglip-384-prismatic/  # optional 384px base
+├── openvla-7b-dinosiglip-384-prismatic/  # 384px VLA used by the paper configuration
 │   ├── BASE_VERIFIED.json
 │   ├── config.json
 │   ├── dataset_statistics.json
@@ -73,19 +73,18 @@ The training launchers expect an OpenVLA/OXE robot-pretrained base with a DINOv2
   models/openvla-7b-modelscope-prismatic --full-hash
 ```
 
-### Optional 384px vision encoder
+### 384px robot-pretrained VLA base
 
-The default launcher profile remains `openvla-224`, so existing runs continue to use the verified
-`prism-dinosiglip-224px+7b` base. To use the 384px visual encoder, select
-`VISION_BACKBONE_PROFILE=dinosiglip-384`. This profile uses the fused
-`DINOv2 + SigLIP-SO/14 @ 384px` backbone registered as `dinosiglip-vit-so-384px` and enables the
-runtime `--require_384px_backbone true` guard.
+The paper configuration uses 384px visual input with the fused
+`DINOv2 + SigLIP-SO/14 @ 384px` backbone registered as `dinosiglip-vit-so-384px`. Before AVA-VLA
+training, a compatible 384px VLM must first be trained on robot demonstrations using the OpenVLA VLA
+training procedure. This produces the robot-pretrained 384px VLA checkpoint used to initialize
+AVA-VLA. Reproducing the full configuration requires this preceding VLM-to-VLA training stage.
 
-A 224px OpenVLA checkpoint is **not** converted or partially loaded into the 384px encoder. Supply a
-separate Prismatic checkpoint that is already OXE/robot-pretrained with `prism-dinosiglip+7b`, plus
-matching dataset statistics and `BASE_VERIFIED.json`. The generic multimodal
-`models/prism-dinosiglip+7b` artifact is not an OXE robot base and is intentionally rejected.
-Validate a candidate before allocating GPUs:
+Store the resulting checkpoint under `models/openvla-7b-dinosiglip-384-prismatic` together with its
+matching dataset statistics and `BASE_VERIFIED.json`. A generic 384px VLM or a 224px OpenVLA
+checkpoint is not a substitute for this robot-pretrained 384px VLA. Validate the prepared base before
+allocating GPUs:
 
 ```bash
 ./.venv/bin/python scripts/validate_avavla_vision_base.py \
@@ -107,8 +106,9 @@ nohup env \
 
 The 384px profile writes to `runs/paper_per_suite_dinosiglip384`,
 `logs/paper_reproduction_dinosiglip384`, and `results/paper_per_suite_dinosiglip384` by default,
-so it cannot reuse or overwrite an active 224px run. The all-suite launcher accepts the same two
-environment variables and uses corresponding `paper_all_suites_dinosiglip384` directories.
+so it cannot reuse or overwrite a run using another vision profile. The all-suite launcher accepts
+the same two environment variables and uses corresponding `paper_all_suites_dinosiglip384`
+directories.
 Saved checkpoints record the 384px requirement; deployment reconstructs the encoder and image
 transform from that saved configuration.
 
@@ -172,9 +172,9 @@ The default full training configuration is:
 | Exit delta | 0.05 |
 | Gradient clipping | 1.0 |
 
-The installed reference robot base is `prism-dinosiglip-224px+7b`; the optional
-`dinosiglip-384` profile selects `prism-dinosiglip+7b` from a separate compatible robot base.
-Training, online rollout, and deterministic evaluation derive image resolution and transforms from the selected checkpoint and share the same proprioception statistics, action normalization, action chunking, and history convention.
+Training, online rollout, and deterministic evaluation derive image resolution and transforms from
+the selected robot-pretrained VLA checkpoint and share the same proprioception statistics, action
+normalization, action chunking, and history convention.
 
 ## LIBERO training and evaluation
 
