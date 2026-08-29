@@ -267,24 +267,6 @@ PYTHONPATH="$PWD/third_party/calvin_runtime:$PWD/third_party/calvin/calvin_model
   --output results/calvin_protocol_check.json
 ```
 
-## Reproducing Table 5: early-exit threshold sweep
-
-Table 5 reuses a trained Table 1 all-suite checkpoint and evaluates the following exit thresholds:
-
-```text
-0.30, 0.40, 0.50, 0.55, 0.65, 0.75, 0.85, 0.95, 1.00
-```
-
-```bash
-./.venv/bin/python scripts/run_table5_threshold_sweep.py \
-  --checkpoint runs/paper_all_suites/paper_all_suites_seed0 \
-  --output-root results/table5 \
-  --shards 8 \
-  --num-trials-per-task 50
-```
-
-The evaluator records success, reasoning steps, mean latency, and P90 latency for every threshold. Report the GPU model and software environment together with latency measurements.
-
 ## Validation and smoke tests
 
 Run the CPU/static contracts before allocating a full training job:
@@ -354,7 +336,6 @@ Main result files:
 results/paper_per_suite/<suite>/seed<seed>/evaluation_results.json
 results/paper_per_suite/table1_ours_per_suite.json
 results/paper_all_suites/table1_ours_all_policy.json
-results/table5/table5_results.json
 ```
 
 LIBERO evaluation uses 10 tasks, 50 trials per task, center crop, proprioception normalization, latent history, and an open-loop action chunk of 8.
@@ -387,7 +368,6 @@ experiments/robot/calvin/dataset.py          CALVIN dataset adapter
 experiments/robot/calvin/online_rollout.py   CALVIN online collector
 experiments/robot/calvin/run_calvin_eval.py  CALVIN sequence evaluation
 scripts/aggregate_table1_ours.py             Table 1 aggregation
-scripts/run_table5_threshold_sweep.py        Table 5 evaluation
 ```
 
 Architecture details, PPO data flow, normalization contracts, checkpoint schema, and extended debugging instructions are documented in [IMPLEMENTATION_REPRODUCTION_NOTES.md](IMPLEMENTATION_REPRODUCTION_NOTES.md).
