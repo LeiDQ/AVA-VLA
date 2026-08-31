@@ -234,6 +234,7 @@ def compare_models(
         checkpoint_path=avavla_checkpoint,
         device=device,
         enable_latent_reasoning=False,
+        allow_no_reasoning_ablation=True,
     )
     
     print("\n[4] Evaluating AVA-VLA (w/o latent reasoning) on dataset...")

@@ -98,6 +98,7 @@ class GenerateConfig:
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
     enable_latent_reasoning: bool = True             # (For AVA-VLA) Enable latent reasoning
+    allow_no_reasoning_ablation: bool = False        # Explicit opt-in; formal evaluation keeps reasoning enabled
     max_reasoning_steps: Optional[int] = None         # (For AVA-VLA) Maximum latent reasoning steps
     fixed_reasoning_steps: Optional[int] = None       # (For AVA-VLA) Fixed reasoning steps, disables adaptive exit
     exit_threshold: Optional[float] = None            # (For AVA-VLA) Early-exit confidence threshold

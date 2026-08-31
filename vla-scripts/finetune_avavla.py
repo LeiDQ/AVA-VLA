@@ -1879,6 +1879,15 @@ def save_base_prismatic_checkpoint(avavla: AVAVLA, checkpoint_path: Path) -> Non
     )
 
 
+def resolve_checkpoint_map_location(device_id) -> torch.device:
+    """Return a torch.load-compatible device for a local distributed rank."""
+    if isinstance(device_id, torch.device):
+        return device_id
+    if isinstance(device_id, int):
+        return torch.device("cuda", device_id) if torch.cuda.is_available() else torch.device("cpu")
+    return torch.device(device_id)
+
+
 def load_resume_state(
     cfg: AVAVLAFinetuneConfig,
     avavla,
@@ -1894,7 +1903,7 @@ def load_resume_state(
     root = _component_root(Path(cfg.vla_path))
     _validate_checkpoint_manifest(root)
     step = cfg.resume_step
-    map_location = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+    map_location = resolve_checkpoint_map_location(device_id)
 
     avavla_state_path = _find_component_checkpoint(root, "avavla", step)
     if avavla_state_path is not None:
@@ -2748,7 +2757,10 @@ def execute_paper_training(
             f"exit_calibration_buffer_rank{distributed_state.process_index}.pt",
         )
         if cfg.resume and calibration_buffer_path.exists():
-            saved_rollouts = torch.load(calibration_buffer_path, map_location=device_id)
+            saved_rollouts = torch.load(
+                calibration_buffer_path,
+                map_location=resolve_checkpoint_map_location(device_id),
+            )
             calibration_rollouts.extend(saved_rollouts)
             if calibration_rollouts:
                 last_rollout = calibration_rollouts[-1]

@@ -78,6 +78,7 @@ def get_model(cfg: Any, wrap_diffusion_policy_for_droid: bool = False) -> torch.
             enable_latent_reasoning=getattr(cfg, "enable_latent_reasoning", True),
             max_reasoning_steps=getattr(cfg, "max_reasoning_steps", None),
             exit_threshold=getattr(cfg, "exit_threshold", None),
+            allow_no_reasoning_ablation=getattr(cfg, "allow_no_reasoning_ablation", False),
         )
     else:
         raise ValueError(f"Unsupported model family: {cfg.model_family}")

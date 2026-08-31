@@ -240,6 +240,11 @@ def test_robot_action_ppo_gradient_contract() -> None:
 
 
 def test_atomic_checkpoint_and_resume_step_contract() -> None:
+    expected_device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    assert FINETUNE.resolve_checkpoint_map_location(3) == expected_device
+    assert FINETUNE.resolve_checkpoint_map_location("cpu") == torch.device("cpu")
+    assert FINETUNE.resolve_checkpoint_map_location(torch.device("cpu")) == torch.device("cpu")
+
     with tempfile.TemporaryDirectory() as temporary_directory:
         root = Path(temporary_directory)
         artifact = root / "training_state--step-17-bc_checkpoint.pt"

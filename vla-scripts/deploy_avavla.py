@@ -138,6 +138,7 @@ def load_avavla_model(
     enable_latent_reasoning: bool = True,
     max_reasoning_steps: Optional[int] = None,
     exit_threshold: Optional[float] = None,
+    allow_no_reasoning_ablation: bool = False,
 ) -> tuple:
     """
     Load AVA-VLA model from checkpoint.
@@ -193,7 +194,7 @@ def load_avavla_model(
     else:
         raise ValueError(f"Unsupported config.json format in {config_path}")
 
-    if not enable_latent_reasoning:
+    if not enable_latent_reasoning and not allow_no_reasoning_ablation:
         raise RuntimeError("Formal AVA-VLA evaluation requires latent reasoning to be enabled.")
     vla_metadata = config_json.get("vla", {})
     metadata_text = json.dumps(vla_metadata, sort_keys=True).lower()
@@ -257,7 +258,9 @@ def load_avavla_model(
         reasoning_policy_type=avavla_cfg.get("reasoning_policy_type", "gaussian"),
         max_reasoning_steps=max_reasoning_steps,
         exit_threshold=exit_threshold,
-        enable_latent_reasoning=enable_latent_reasoning,
+        # Ablations still construct and load the complete checkpoint, then
+        # disable only the inference path after strict state restoration.
+        enable_latent_reasoning=(enable_latent_reasoning or allow_no_reasoning_ablation),
     )
 
     image_resolution = tuple(int(x) for x in model.vision_backbone.default_image_resolution[-2:])
@@ -277,6 +280,8 @@ def load_avavla_model(
         raise RuntimeError(f"Missing complete AVA-VLA state under {checkpoint_path}")
     print(f"Loading AVA-VLA components from {avavla_state_path}")
     model.load_avavla_state_dict(torch.load(avavla_state_path, map_location=device), strict=True)
+    if allow_no_reasoning_ablation and not enable_latent_reasoning:
+        model.enable_latent_reasoning = False
 
     action_head_path = _find_component_checkpoint(checkpoint_path, "action_head")
     if not avavla_cfg.get("use_l1_regression", False):
