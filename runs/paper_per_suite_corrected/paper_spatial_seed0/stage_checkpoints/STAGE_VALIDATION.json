@@ -1,0 +1,45 @@
+{
+  "cross_stage_invariants": {
+    "latent_warmup_freeze_contract": true
+  },
+  "passed": true,
+  "run_dir": "/mnt/workspace/users/leidianqiao/test/AVA-VLA-audit-9f3e53a/runs/paper_per_suite_corrected/paper_spatial_seed0",
+  "stages": {
+    "bc_complete": {
+      "boundary_checks": {
+        "global_step_consistent": true,
+        "manifest_matches_training_state": true,
+        "stage_counter_complete": true
+      },
+      "calibration_buffer_rollouts": {},
+      "log_step": 100000,
+      "required_file_count": 15
+    },
+    "latent_warmup_complete": {
+      "boundary_checks": {
+        "global_step_consistent": true,
+        "manifest_matches_training_state": true,
+        "stage_counter_complete": true
+      },
+      "calibration_buffer_rollouts": {},
+      "log_step": 150000,
+      "required_file_count": 15
+    }
+  },
+  "state_hashes": {
+    "bc_complete": {
+      "action_head": "ded570c0026b3009cb8fe89828bcd6540d731e95e0b4d65c3a2278ad5ebd5909",
+      "all": "55c5a733b564c5ef1cc0b0ab87daf64ae2b0449ea16f1a64f7fdb4738c5c6ad2",
+      "exit_gate": "426c31528c23e4368b91f3f7a7df4337058120179fd124e7dc72b76218a31a27",
+      "outside_exit_gate": "cb574fbb07add82a36e5eecdef22255274944f821b06424229d61946d665165d",
+      "outside_warmup": "60f6f66e3479c423d7105e85eca64596a119a9e973fbdf1191319d9bcad84180"
+    },
+    "latent_warmup_complete": {
+      "action_head": "ded570c0026b3009cb8fe89828bcd6540d731e95e0b4d65c3a2278ad5ebd5909",
+      "all": "ed14e502570725bcdbd6b2fc4609996e1d1ce5b36c4bf94d746190fcb9d544d3",
+      "exit_gate": "426c31528c23e4368b91f3f7a7df4337058120179fd124e7dc72b76218a31a27",
+      "outside_exit_gate": "16a56961cf9936a2584686e8b8b75f23964f1925aa2e8ca952e0c7c2c53ed8b3",
+      "outside_warmup": "60f6f66e3479c423d7105e85eca64596a119a9e973fbdf1191319d9bcad84180"
+    }
+  }
+}
