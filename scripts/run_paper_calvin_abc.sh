@@ -78,7 +78,9 @@ if [[ ! -f "$RUN_DIR/TRAINING_COMPLETE" ]]; then
         --entropy_coef 0.01 \
         --smoothness_coef 0.1 \
         --action_ppo_std 0.05 \
-        --action_ppo_coef 1.0 \
+        --action_ppo_coef 0.0 \
+        --ppo_target_kl 0.02 \
+        --ppo_max_backtracks 12 \
         --max_reasoning_steps 5 \
         --exit_threshold 0.55 \
         --exit_calibration_steps 10000 \

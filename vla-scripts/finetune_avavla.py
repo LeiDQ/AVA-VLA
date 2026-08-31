@@ -132,6 +132,7 @@ class AVAVLAFinetuneConfig:
     libero_task_suites: str = "libero_spatial,libero_object,libero_goal,libero_10"
     bc_steps: int = 100_000
     latent_warmup_steps: int = 50_000
+    latent_warmup_action_coef: float = 1.0
     exit_calibration_steps: int = 10_000
     require_online_task_rewards: bool = True
     exit_calibration_lookahead: int = 3
@@ -139,7 +140,12 @@ class AVAVLAFinetuneConfig:
     exit_calibration_buffer_rollouts: int = 128
     ppo_bc_aux_coef: float = 1.0
     action_ppo_std: float = 0.05
-    action_ppo_coef: float = 1.0
+    # PPO is applied to the latent reasoning policy described in Sec. 3.5.
+    # The continuous OFT action head remains task-aligned through BC updates;
+    # action-space PPO can still be enabled explicitly for ablations.
+    action_ppo_coef: float = 0.0
+    ppo_target_kl: float = 0.02
+    ppo_max_backtracks: int = 12
     
     require_384px_backbone: bool = False
     require_dinosiglip_backbone: bool = True
@@ -165,6 +171,9 @@ class AVAVLAFinetuneConfig:
     save_latest_checkpoint_only: bool = False
     resume: bool = False
     resume_step: Optional[int] = None
+    # Use only architecture/weights/stage state from a completed BC checkpoint
+    # while taking the new training contract from CLI/defaults.
+    override_resume_training_config: bool = False
     image_aug: bool = True
     history_window_size: int = NUM_ACTIONS_CHUNK + 1
     
@@ -231,10 +240,16 @@ def resolve_paper_training_budget(cfg: AVAVLAFinetuneConfig, world_size: int) ->
         raise ValueError("ppo_checkpoint_interval_updates must be positive.")
     if cfg.exit_checkpoint_interval_steps <= 0:
         raise ValueError("exit_checkpoint_interval_steps must be positive.")
-    if cfg.action_ppo_std <= 0:
-        raise ValueError("action_ppo_std must be positive for the stochastic Stage-3 action policy.")
-    if cfg.action_ppo_coef <= 0:
-        raise ValueError("action_ppo_coef must be positive for joint Stage-3 PPO.")
+    if cfg.latent_warmup_action_coef <= 0:
+        raise ValueError("latent_warmup_action_coef must be positive to preserve task alignment.")
+    if cfg.action_ppo_coef < 0:
+        raise ValueError("action_ppo_coef must be non-negative.")
+    if cfg.action_ppo_coef > 0 and cfg.action_ppo_std <= 0:
+        raise ValueError("action_ppo_std must be positive when action-space PPO is enabled.")
+    if cfg.ppo_target_kl <= 0:
+        raise ValueError("ppo_target_kl must be positive.")
+    if cfg.ppo_max_backtracks <= 0:
+        raise ValueError("ppo_max_backtracks must be positive.")
     effective_rollout_batch = cfg.ppo_rollout_size_per_rank * world_size
     if effective_rollout_batch != cfg.ppo_effective_batch_size:
         raise ValueError(
@@ -410,7 +425,7 @@ def build_stage_optimizer(
     add_group(model.value_function.parameters(), cfg.critic_lr)
     add_group(model.exit_gate.parameters(), cfg.critic_lr)
     if head is not None:
-        add_group(head.parameters(), cfg.learning_rate)
+        add_group(head.parameters(), cfg.policy_lr if stage == "ppo" else cfg.learning_rate)
 
     optimizer = Adam(groups, betas=(cfg.adam_beta1, cfg.adam_beta2), eps=cfg.adam_eps)
     def lr_scale(step: int) -> float:
@@ -919,12 +934,16 @@ def compute_robot_action_ppo_loss(
         device=current_means.device,
         dtype=current_means.dtype,
     )
+    action_approx_kl = (
+        (current_means - old_means).pow(2) / (2.0 * float(action_policy_std) ** 2)
+    ).sum(dim=(-1, -2)).mean()
     sample_deviation = (samples - old_means).pow(2).mean().sqrt()
     mean_shift = (current_means - old_means).pow(2).mean().sqrt()
     out_of_bounds_fraction = (current_means.abs() > 1.0).float().mean()
     return action_policy_loss, {
         "robot_action_policy_loss": float(action_policy_loss.detach().cpu()),
         "robot_action_ppo_ratio_mean": float(ratio.mean().detach().cpu()),
+        "robot_action_ppo_approx_kl": float(action_approx_kl.detach().cpu()),
         "robot_action_ppo_clip_fraction": float(
             ((ratio - 1.0).abs() > clip_ratio).float().mean().detach().cpu()
         ),
@@ -962,15 +981,25 @@ def run_ppo_updates(
     cfg: AVAVLAFinetuneConfig,
     rollout: Dict,
 ) -> Dict[str, float]:
-    """Run multi-epoch minibatch PPO updates against a frozen on-policy rollout."""
+    """Run multi-epoch minibatch PPO updates against a frozen on-policy rollout.
+
+    PPO clipping bounds the objective, but it does not by itself bound the
+    parameter displacement produced by Adam.  The 64-dimensional latent action
+    distribution is especially sensitive to one oversized first update.  Each
+    candidate actor step is therefore checked against the frozen rollout and
+    backtracked before it is accepted when it exceeds the target-KL trust
+    region.  This keeps the paper learning rate as the maximum candidate step
+    instead of silently committing an already off-policy update.
+    """
     model = avavla.module if hasattr(avavla, "module") else avavla
     head_module = action_head.module if action_head is not None and hasattr(action_head, "module") else action_head
     if head_module is None:
         raise RuntimeError("Paper Stage-3 PPO requires an action head")
 
-    # Collection is in eval mode. Replay the whole current OFT action path in
-    # eval mode as well so the first likelihood ratio is exactly on-policy while
-    # retaining gradients through projector -> frozen Llama -> action head.
+    # Collection is in eval mode.  Evaluate PPO in the same mode and against
+    # the frozen latent states/observations from that rollout.  Replaying a
+    # changing recurrent transition inside the likelihood ratio compounds
+    # parameter drift across reasoning steps and violates the PPO trust region.
     prior_model_training = model.training
     prior_head_training = head_module.training
     model.eval()
@@ -982,6 +1011,86 @@ def run_ppo_updates(
     local_minibatch_size = max(1, int(cfg.ppo_minibatch_size) // world_size)
     minibatch_size = min(local_minibatch_size, batch_size)
     metric_rows: List[Dict[str, float]] = []
+    optimizer_minibatches = 0
+    stopped_for_kl = False
+    max_allowed_kl = 1.5 * float(cfg.ppo_target_kl)
+
+    objective_kwargs = {
+        "gamma": cfg.gamma,
+        "entropy_coef": cfg.entropy_coef,
+        "smoothness_coef": cfg.smoothness_coef,
+        "value_coef": cfg.value_coef,
+        "exit_loss_coef": 0.0,
+        "ppo_clip_ratio": cfg.ppo_clip_ratio,
+        "gae_lambda": cfg.gae_lambda,
+        "recompute_policy": True,
+        "recompute_dynamics": False,
+        "recompute_observation": False,
+        "train_exit_gate": False,
+    }
+
+    def evaluate_objective(minibatch: Dict):
+        rl_loss, rl_metrics = avavla(
+            training_objective="ppo",
+            reasoning_trajectories=minibatch,
+            rl_rewards=minibatch["ppo_rewards"],
+            objective_kwargs=objective_kwargs,
+        )
+        if cfg.action_ppo_coef > 0:
+            action_rl_loss, action_metrics = compute_robot_action_ppo_loss(
+                avavla,
+                action_head,
+                minibatch,
+                clip_ratio=cfg.ppo_clip_ratio,
+                action_policy_std=cfg.action_ppo_std,
+            )
+            action_metrics["robot_action_ppo_enabled"] = 1.0
+        else:
+            action_rl_loss = rl_loss.new_zeros(())
+            action_metrics = {
+                "robot_action_policy_loss": 0.0,
+                "robot_action_ppo_ratio_mean": 1.0,
+                "robot_action_ppo_clip_fraction": 0.0,
+                "robot_action_ppo_approx_kl": 0.0,
+                "robot_action_ppo_enabled": 0.0,
+                "ppo_action_path_recomputed": 0.0,
+                "ppo_joint_action_update": 0.0,
+            }
+        return rl_loss, rl_metrics, action_rl_loss, action_metrics
+
+    def global_max_kl(rl_metrics: Dict[str, float], action_metrics: Dict[str, float]) -> float:
+        local_kl = max(
+            float(rl_metrics.get("ppo_approx_kl", 0.0)),
+            float(action_metrics.get("robot_action_ppo_approx_kl", 0.0)),
+        )
+        value = torch.tensor(local_kl, device=rewards.device, dtype=torch.float32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(value, op=dist.ReduceOp.MAX)
+        return float(value.cpu())
+
+    # With latent PPO only, these are exactly the parameters that determine the
+    # likelihood ratio.  The optional robot-action PPO path additionally
+    # depends on the trainable observation/action path, so include every
+    # non-critic trainable parameter in that ablation.
+    if cfg.action_ppo_coef > 0:
+        trust_region_parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+            and not name.startswith("value_function.")
+            and not name.startswith("exit_gate.")
+        ]
+        trust_region_parameters.extend(
+            parameter for parameter in head_module.parameters() if parameter.requires_grad
+        )
+    else:
+        trust_region_parameters = [
+            parameter
+            for parameter in model.reasoning_policy.parameters()
+            if parameter.requires_grad
+        ]
+    if not trust_region_parameters:
+        raise RuntimeError("PPO trust region has no trainable policy parameters")
 
     for epoch in range(max(1, int(cfg.ppo_epochs))):
         permutation = torch.randperm(batch_size, device=rewards.device)
@@ -989,32 +1098,19 @@ def run_ppo_updates(
             indices = permutation[start : start + minibatch_size]
             minibatch = slice_ppo_rollout(rollout, indices)
             optimizer.zero_grad(set_to_none=True)
-            rl_loss, rl_metrics = avavla(
-                training_objective="ppo",
-                reasoning_trajectories=minibatch,
-                rl_rewards=minibatch["ppo_rewards"],
-                objective_kwargs={
-                    "gamma": cfg.gamma,
-                    "entropy_coef": cfg.entropy_coef,
-                    "smoothness_coef": cfg.smoothness_coef,
-                    "value_coef": cfg.value_coef,
-                    "exit_loss_coef": 0.0,
-                    "ppo_clip_ratio": cfg.ppo_clip_ratio,
-                    "gae_lambda": cfg.gae_lambda,
-                    "recompute_policy": True,
-                    "recompute_dynamics": True,
-                    "recompute_observation": True,
-                    "train_exit_gate": False,
-                },
-            )
-            action_rl_loss, action_rl_metrics = compute_robot_action_ppo_loss(
-                avavla,
-                action_head,
-                minibatch,
-                clip_ratio=cfg.ppo_clip_ratio,
-                action_policy_std=cfg.action_ppo_std,
-            )
+            rl_loss, rl_metrics, action_rl_loss, action_rl_metrics = evaluate_objective(minibatch)
             joint_ppo_loss = rl_loss + cfg.action_ppo_coef * action_rl_loss
+
+            pre_update_kl = global_max_kl(rl_metrics, action_rl_metrics)
+            if pre_update_kl > max_allowed_kl:
+                if optimizer_minibatches == 0:
+                    raise RuntimeError(
+                        "Pre-update PPO KL exceeds the on-policy contract: "
+                        f"KL={pre_update_kl:.6g}, target={cfg.ppo_target_kl:.6g}."
+                    )
+                stopped_for_kl = True
+                break
+
             joint_ppo_loss.backward()
             action_rl_metrics.update(
                 {
@@ -1025,21 +1121,87 @@ def run_ppo_updates(
             )
             synchronize_gradients(trainable_params)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
+            before_step = [parameter.detach().clone() for parameter in trust_region_parameters]
             optimizer.step()
             scheduler.step()
-            rl_metrics["latent_rl_loss"] = float(rl_loss.detach().cpu())
-            rl_metrics.update(action_rl_metrics)
-            rl_metrics["joint_ppo_loss"] = float(joint_ppo_loss.detach().cpu())
-            rl_metrics["total_rl_loss"] = float(joint_ppo_loss.detach().cpu())
-            rl_metrics["ppo_epoch"] = float(epoch + 1)
-            rl_metrics["ppo_minibatch_size"] = float(indices.numel())
-            rl_metrics["ppo_grad_norm"] = float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm)
-            metric_rows.append(rl_metrics)
+
+            # Check the candidate parameters, then interpolate only the policy
+            # displacement back toward the pre-step parameters until all ranks
+            # are within the same global trust region.  Critic updates do not
+            # affect the likelihood ratio and remain at the full critic LR.
+            with torch.no_grad():
+                post_rl_loss, post_rl_metrics, post_action_loss, post_action_metrics = (
+                    evaluate_objective(minibatch)
+                )
+            post_update_kl = global_max_kl(post_rl_metrics, post_action_metrics)
+            accepted_scale = 1.0
+            backtrack_count = 0
+            if post_update_kl > max_allowed_kl:
+                candidate_deltas = [
+                    parameter.detach().clone().sub_(before)
+                    for parameter, before in zip(trust_region_parameters, before_step)
+                ]
+                for backtrack_count in range(1, int(cfg.ppo_max_backtracks) + 1):
+                    accepted_scale *= 0.5
+                    with torch.no_grad():
+                        for parameter, before, delta in zip(
+                            trust_region_parameters, before_step, candidate_deltas
+                        ):
+                            parameter.copy_(before + accepted_scale * delta)
+                        post_rl_loss, post_rl_metrics, post_action_loss, post_action_metrics = (
+                            evaluate_objective(minibatch)
+                        )
+                    post_update_kl = global_max_kl(post_rl_metrics, post_action_metrics)
+                    if post_update_kl <= max_allowed_kl:
+                        break
+                else:
+                    accepted_scale = 0.0
+                    with torch.no_grad():
+                        for parameter, before in zip(trust_region_parameters, before_step):
+                            parameter.copy_(before)
+                        post_rl_loss, post_rl_metrics, post_action_loss, post_action_metrics = (
+                            evaluate_objective(minibatch)
+                        )
+                    post_update_kl = global_max_kl(post_rl_metrics, post_action_metrics)
+
+            optimizer_minibatches += 1
+            post_joint_loss = post_rl_loss + cfg.action_ppo_coef * post_action_loss
+            post_rl_metrics["latent_rl_loss"] = float(post_rl_loss.detach().cpu())
+            post_rl_metrics.update(post_action_metrics)
+            for gradient_metric in (
+                "ppo_projector_grad_norm",
+                "ppo_latent_to_llm_grad_norm",
+                "ppo_action_head_grad_norm",
+            ):
+                post_rl_metrics[gradient_metric] = action_rl_metrics[gradient_metric]
+            post_rl_metrics["joint_ppo_loss"] = float(post_joint_loss.detach().cpu())
+            post_rl_metrics["total_rl_loss"] = float(post_joint_loss.detach().cpu())
+            post_rl_metrics["ppo_epoch"] = float(epoch + 1)
+            post_rl_metrics["ppo_minibatch_size"] = float(indices.numel() * world_size)
+            post_rl_metrics["ppo_local_minibatch_size"] = float(indices.numel())
+            post_rl_metrics["ppo_grad_norm"] = float(
+                grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm
+            )
+            post_rl_metrics["ppo_pre_update_approx_kl"] = pre_update_kl
+            post_rl_metrics["ppo_global_max_kl"] = post_update_kl
+            post_rl_metrics["ppo_trust_region_scale"] = accepted_scale
+            post_rl_metrics["ppo_trust_region_backtracks"] = float(backtrack_count)
+            post_rl_metrics["ppo_early_stop_kl"] = 0.0
+            post_rl_metrics["ppo_optimizer_minibatches"] = float(optimizer_minibatches)
+            metric_rows.append(post_rl_metrics)
+            if accepted_scale == 0.0:
+                stopped_for_kl = True
+                break
+        if stopped_for_kl:
+            break
 
     optimizer.zero_grad(set_to_none=True)
     model.train(prior_model_training)
     head_module.train(prior_head_training)
-    return average_metric_dicts(metric_rows)
+    metrics = average_metric_dicts(metric_rows)
+    metrics["ppo_optimizer_minibatches"] = float(optimizer_minibatches)
+    metrics["ppo_early_stop_kl"] = float(stopped_for_kl)
+    return metrics
 
 
 def make_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
@@ -1072,6 +1234,7 @@ def make_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
         "paper_schedule": {
             "bc_steps": cfg.bc_steps,
             "latent_warmup_steps": cfg.latent_warmup_steps,
+            "latent_warmup_action_coef": cfg.latent_warmup_action_coef,
             "ppo_environment_steps": cfg.ppo_environment_steps,
             "exit_calibration_steps": cfg.exit_calibration_steps,
         },
@@ -1100,8 +1263,14 @@ def make_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
             "ppo_bc_aux_coef": cfg.ppo_bc_aux_coef,
             "action_ppo_std": cfg.action_ppo_std,
             "action_ppo_coef": cfg.action_ppo_coef,
+            "ppo_target_kl": cfg.ppo_target_kl,
+            "ppo_max_backtracks": cfg.ppo_max_backtracks,
             "ppo_checkpoint_interval_updates": cfg.ppo_checkpoint_interval_updates,
             "regularizers_in_reward_only": True,
+            "continuous_uncertainty_penalty": "positive_per_dimension_differential_entropy",
+            "latent_ppo_state_contract": "fixed_fp32_rollout_states_v1",
+            "ppo_update_contract": "post_step_kl_backtracking_v1",
+            "stage2_task_alignment": "frozen_action_policy_demonstration_l1",
         },
         "optimizer": {
             "name": "Adam",
@@ -1432,6 +1601,57 @@ def _archive_completed_stage_checkpoint(
     return archive_dir
 
 
+def _inherit_completed_stage_checkpoint(source_dir: Path, run_dir: Path, stage: str) -> Path:
+    """Register an external completed-stage checkpoint in a branched run.
+
+    Branching Stage 2 from a preserved BC boundary must retain the complete
+    four-stage provenance inside the new run.  Files are hard-linked when the
+    source and destination share a filesystem, so the 30 GB immutable base
+    checkpoint is not duplicated.
+    """
+    source_dir = Path(source_dir)
+    source_manifest = _validate_checkpoint_manifest(source_dir)
+    if str(source_manifest.get("stage", "")) != stage:
+        raise RuntimeError(
+            f"Cannot inherit stage={stage} from {source_dir}: "
+            f"manifest stage={source_manifest.get('stage')}"
+        )
+    source_metadata = source_dir / "STAGE_CHECKPOINT.json"
+    if not source_metadata.is_file():
+        raise RuntimeError(f"Inherited stage checkpoint has no metadata: {source_metadata}")
+
+    destination = Path(run_dir) / "stage_checkpoints" / stage
+    if destination.is_dir():
+        destination_manifest = _validate_checkpoint_manifest(destination)
+        if (
+            destination_manifest.get("stage") == stage
+            and int(destination_manifest.get("log_step", -1))
+            == int(source_manifest.get("log_step", -2))
+        ):
+            return destination
+        raise RuntimeError(f"Refusing to replace incompatible inherited stage: {destination}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    try:
+        for relative_name, expected_size in source_manifest["required_files"].items():
+            source = source_dir / relative_name
+            if not source.is_file() or source.stat().st_size != int(expected_size):
+                raise RuntimeError(f"Inherited stage artifact is incomplete: {source}")
+            _link_or_copy_base_checkpoint(source, temporary / relative_name)
+        _atomic_write_json(source_manifest, temporary / "CHECKPOINT_COMPLETE.json")
+        _link_or_copy_base_checkpoint(source_metadata, temporary / "STAGE_CHECKPOINT.json")
+        _validate_checkpoint_manifest(temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return destination
+
+
 def _restore_stage_artifact_for_resume(cfg, run_dir: Path, artifact_name: str) -> Path:
     """Materialize a stage-local artifact when resuming from an archived checkpoint."""
     destination = Path(run_dir) / artifact_name
@@ -1486,7 +1706,34 @@ def apply_saved_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
             "This checkpoint predates the end-to-end OpenVLA-OFT action-PPO and direct-action parameterization contract and cannot be resumed safely. "
             "Start a new run from the OpenVLA Prismatic base checkpoint."
         )
-    _validate_checkpoint_manifest(component_root)
+    manifest = _validate_checkpoint_manifest(component_root)
+    saved_rl = saved_cfg.get("rl", {})
+    saved_contract = saved_rl.get("latent_ppo_state_contract")
+    saved_update_contract = saved_rl.get("ppo_update_contract")
+    checkpoint_stage = str(manifest.get("stage", ""))
+    if (
+        saved_contract != "fixed_fp32_rollout_states_v1"
+        and checkpoint_stage not in {"bc", "bc_complete"}
+    ):
+        raise RuntimeError(
+            "This checkpoint predates the stable latent-PPO objective contract. "
+            "Restart Stage 2 from the preserved bc_complete checkpoint instead of resuming it."
+        )
+    if (
+        saved_update_contract != "post_step_kl_backtracking_v1"
+        and checkpoint_stage not in {"bc", "bc_complete"}
+    ):
+        raise RuntimeError(
+            "This checkpoint predates transactional PPO trust-region updates. "
+            "Restart Stage 2 from the preserved bc_complete checkpoint instead of resuming it."
+        )
+    if cfg.override_resume_training_config and checkpoint_stage not in {
+        "bc",
+        "bc_complete",
+    }:
+        raise RuntimeError(
+            "override_resume_training_config is only allowed when branching from a BC checkpoint."
+        )
 
     top_level_fields = (
         "use_l1_regression",
@@ -1517,22 +1764,25 @@ def apply_saved_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
         if field_name in saved_cfg:
             setattr(cfg, field_name, saved_cfg[field_name])
 
-    for field_name, value in saved_cfg.get("rl", {}).items():
-        if hasattr(cfg, field_name):
-            setattr(cfg, field_name, value)
-    for field_name, value in saved_cfg.get("paper_schedule", {}).items():
-        if hasattr(cfg, field_name):
-            setattr(cfg, field_name, value)
+    if not cfg.override_resume_training_config:
+        for field_name, value in saved_cfg.get("rl", {}).items():
+            if hasattr(cfg, field_name):
+                setattr(cfg, field_name, value)
+        for field_name, value in saved_cfg.get("paper_schedule", {}).items():
+            if hasattr(cfg, field_name):
+                setattr(cfg, field_name, value)
 
-    optimizer_field_aliases = {
-        "beta1": "adam_beta1",
-        "beta2": "adam_beta2",
-        "eps": "adam_eps",
-    }
-    for field_name, value in saved_cfg.get("optimizer", {}).items():
-        config_field = optimizer_field_aliases.get(field_name, field_name)
-        if field_name != "name" and hasattr(cfg, config_field):
-            setattr(cfg, config_field, value)
+        optimizer_field_aliases = {
+            "beta1": "adam_beta1",
+            "beta2": "adam_beta2",
+            "eps": "adam_eps",
+        }
+        for field_name, value in saved_cfg.get("optimizer", {}).items():
+            config_field = optimizer_field_aliases.get(field_name, field_name)
+            if field_name != "name" and hasattr(cfg, config_field):
+                setattr(cfg, config_field, value)
+    else:
+        print("Branching from BC weights with the current CLI training contract")
 
     print(f"Loaded AVA hyperparameters from {config_path}")
     return saved_cfg
@@ -2106,6 +2356,19 @@ def execute_paper_training(
         raise ValueError(f"Unknown resume stage: {resume_stage}")
     resume_rank = stage_order[resume_stage]
 
+    if cfg.resume and resume_stage == "bc_complete":
+        source_stage = _component_root(Path(cfg.vla_path))
+        if source_stage.resolve() != Path(run_dir).resolve():
+            distributed_barrier()
+            if distributed_state.is_main_process:
+                inherited = _inherit_completed_stage_checkpoint(
+                    source_stage,
+                    Path(run_dir),
+                    "bc_complete",
+                )
+                print(f"Inherited completed BC checkpoint at {inherited}", flush=True)
+            distributed_barrier()
+
     if resume_stage == "complete":
         distributed_barrier()
         if distributed_state.is_main_process:
@@ -2344,7 +2607,11 @@ def execute_paper_training(
                 stage_step=cfg.bc_steps,
             )
 
-        # Stage 2: action policy frozen; only smooth latent dynamics are warmed up.
+        # Stage 2: freeze the action policy while aligning the reasoning path to
+        # demonstrated actions.  Appendix B.3 sets lambda_1=0 here, so
+        # smoothness is the only *regularizer*, not the only training signal.
+        # The frozen action head turns demonstration L1 into a dense surrogate
+        # for task quality and prevents the smoothness-only identity solution.
         optimizer, scheduler, trainable_params = build_stage_optimizer(
             avavla, action_head, "latent_warmup", cfg
         )
@@ -2364,41 +2631,38 @@ def execute_paper_training(
         )
         warmup_start = max(0, min(cfg.latent_warmup_steps, warmup_start))
         for stage_step in range(warmup_start, cfg.latent_warmup_steps):
-            batch = next_demo_batch()
-            input_ids = batch["input_ids"].to(device_id)
-            attention_mask = batch["attention_mask"].to(device_id)
-            labels = batch["labels"].to(device_id)
-            pixel_values = move_to_device(batch["pixel_values"], device_id)
-            wrist = batch.get("pixel_values_wrist")
-            if wrist is not None:
-                wrist = move_to_device(wrist, device_id)
-            proprio = batch.get("proprio")
-            if proprio is not None:
-                proprio = proprio.to(device_id).to(torch.bfloat16)
-
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                history_states = get_batch_history_states(
-                    avavla,
-                    batch,
-                    device_id,
-                    input_ids,
-                    attention_mask,
-                    labels,
-                )
-                loss, metrics, _ = avavla(
-                    training_objective="latent_warmup",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=cast_floating_tensors(pixel_values, torch.bfloat16),
-                    pixel_values_wrist=(
-                        cast_floating_tensors(wrist, torch.bfloat16) if wrist is not None else None
-                    ),
-                    proprio=proprio,
-                    labels=labels,
-                    history_states=history_states,
-                    objective_kwargs={"num_steps": cfg.max_reasoning_steps},
-                )
+            action_alignment_loss, action_metrics, reasoning_info = run_forward_pass_with_latent_reasoning(
+                avavla=avavla,
+                action_head=action_head,
+                batch=next_demo_batch(),
+                action_tokenizer=action_tokenizer,
+                device_id=device_id,
+                cfg=cfg,
+                num_patches=num_patches,
+                training=True,
+                include_rl_loss=False,
+                use_latent_state=True,
+            )
+            model = avavla.module if hasattr(avavla, "module") else avavla
+            smoothness_loss, smoothness_metrics = model.compute_latent_warmup_loss(
+                reasoning_info
+            )
+            loss = (
+                cfg.latent_warmup_action_coef * action_alignment_loss
+                + cfg.smoothness_coef * smoothness_loss
+            )
+            metrics = {
+                "latent_warmup_loss": float(loss.detach().cpu()),
+                "latent_warmup_action_loss": float(action_alignment_loss.detach().cpu()),
+                "latent_warmup_smoothness_loss": float(smoothness_loss.detach().cpu()),
+                "latent_distance_mean": smoothness_metrics["latent_distance_mean"],
+                "latent_warmup_entropy_coef": 0.0,
+                "latent_warmup_action_coef": float(cfg.latent_warmup_action_coef),
+                "latent_warmup_smoothness_coef": float(cfg.smoothness_coef),
+                "curr_action_l1_loss": action_metrics["curr_action_l1_loss"],
+                "next_actions_l1_loss": action_metrics["next_actions_l1_loss"],
+            }
             loss.backward()
             synchronize_gradients(trainable_params)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
@@ -2530,7 +2794,9 @@ def execute_paper_training(
                         unnorm_key=None,
                         rollout_size=cfg.ppo_rollout_size_per_rank,
                         center_crop=cfg.online_center_crop,
-                        action_policy_std=cfg.action_ppo_std,
+                        action_policy_std=(
+                            cfg.action_ppo_std if cfg.action_ppo_coef > 0 else 0.0
+                        ),
                     )
                     if cfg.require_online_task_rewards and "ppo_rewards" not in rollout:
                         raise RuntimeError("Online PPO rollout is missing true task rewards.")

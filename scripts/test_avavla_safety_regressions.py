@@ -366,7 +366,10 @@ def test_ppo_checkpoint_cadence_contract() -> None:
     assert defaults.history_window_size == FINETUNE.NUM_ACTIONS_CHUNK + 1
     assert defaults.ppo_checkpoint_interval_updates == 10
     assert defaults.action_ppo_std == 0.05
-    assert defaults.action_ppo_coef == 1.0
+    assert defaults.action_ppo_coef == 0.0
+    assert defaults.ppo_target_kl == 0.02
+    assert defaults.ppo_max_backtracks == 12
+    assert defaults.latent_warmup_action_coef == 1.0
     assert FINETUNE.CHECKPOINT_IMPLEMENTATION_VERSION >= 9
 
 

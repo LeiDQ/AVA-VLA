@@ -4,7 +4,7 @@
 
 本仓库实现论文 [AVA-VLA: Think Less, Act Early](https://arxiv.org/abs/2606.15099) 的四阶段训练流程，并以 OpenVLA / OpenVLA-OFT 为机器人预训练基座。
 
-Checkpoint 恢复不是只检查文件是否存在：训练和评测会验证原子 manifest、文件大小、动作策略参数化及当前 Stage 3 PPO 所需的 schema。与当前动作 PPO 或推理语义不兼容的旧 checkpoint 会被拒绝或由正式 launcher 归档，不能直接续训。
+Checkpoint 恢复不是只检查文件是否存在：训练和评测会验证原子 manifest、文件大小、动作策略参数化及当前 Stage 3 PPO 所需的 schema。与当前 PPO 或推理语义不兼容的旧 checkpoint 会被拒绝或由正式 launcher 归档，不能直接续训。
 
 ## 当前实现状态
 
@@ -23,7 +23,7 @@ Table 1 支持论文中的两种 Ours 设置：
 训练严格分为四个阶段：
 
 1. Behavior Cloning：100,000 steps，全局 batch size 64。
-2. Latent Reasoning Warmup：50,000 steps，仅优化 latent smoothness。
+2. Latent Reasoning Warmup：50,000 steps；冻结 action policy，以示范动作 L1 保持任务对齐，设置 `lambda_1=0`，并使用 latent smoothness 作为该阶段唯一正则项。
 3. Joint PPO：约 1,200,000 个真实环境交互 steps。
 4. Exit Gate Calibration：`k=3`，边际改善阈值 `delta=0.05`。
 
@@ -39,31 +39,21 @@ Table 3 使用官方 CALVIN ABC→D 协议：在 A/B/C 数据上训练，在 D �
 
 ### 端到端 Stage 3 PPO
 
-在线 rollout 保存精确的 OpenVLA-OFT 图像变换结果、token tensors、latent update actions 和旧策略 log-prob。每个 PPO minibatch 都会使用当前参数重新计算：
+在线 rollout 保存 latent update actions、旧策略 log-prob、FP32 latent state 和 observation encoding。每个 PPO minibatch 都在冻结的 rollout state 上使用当前 reasoning policy 重新计算：
 
 ```text
-frozen backbone features
-  -> multimodal fusion
-  -> initial latent
-  -> latent transition trajectory
-  -> latent_to_llm
-  -> OpenVLA projector
-  -> frozen Llama hidden stream
-  -> continuous L1 action head
+frozen rollout latent state + observation encoding
+  -> current reasoning policy likelihood
   -> clipped PPO objective
 ```
 
-结构化日志会记录 `ppo_projector_grad_norm`、`ppo_latent_to_llm_grad_norm` 和 `ppo_action_head_grad_norm`，用于证明环境奖励确实到达完整动作路径，而不是只更新最后的 action head。
+PPO 的 likelihood ratio 使用 rollout 中冻结的 FP32 latent state 和 observation encoding，避免在同一 rollout 的多轮更新中通过已经变化的 transition 反复重建状态。结构化日志记录 ratio、clip fraction、更新前后 approximate KL 和回溯缩放比例。Adam 候选步若超过 target-KL 信赖域，会在写入 policy 前回溯缩小；后续 epoch 若已到达边界则提前停止。
 
-### 与 OpenVLA-OFT 一致的连续动作参数化
+### Action policy 的训练边界
 
-Action head 直接预测归一化连续动作。PPO 在同一空间使用以该预测为均值的 Gaussian 探索；训练、在线采样和确定性评测使用相同动作均值，不再使用 `clamp -> atanh -> Gaussian -> tanh`，因此不存在 clamp 饱和区的死梯度。
+Action head 直接预测归一化连续动作。论文第 3.5 节明确给出的 PPO policy 是 latent reasoning policy；因此正式配置不再人为给 56 维 OFT action chunk 添加论文未定义的固定方差 Gaussian PPO。在线动作使用 action head 的确定性均值，Stage 3 每轮 PPO 后的 demonstration BC auxiliary update 负责保持和更新 action policy、latent-to-action 接口与多模态投影。
 
-论文没有给出连续动作探索标准差，当前实现明确记录并默认使用：
-
-```text
-action_ppo_std = 0.05 normalized-action units
-```
+代码仍保留可选的 action-space PPO 消融入口；只有显式设置 `action_ppo_coef > 0` 时才启用，并受同一个 KL guard 约束。正式 launcher 使用 `action_ppo_coef=0`。
 
 ### 其他已统一的训练/推理语义
 
@@ -72,8 +62,10 @@ action_ppo_std = 0.05 normalized-action units
 - Center crop 在训练、在线 rollout 和评测中一致生效。
 - History 对齐为前一个 policy decision，即 8 个控制 steps，默认 `history_window_size=9`。
 - 稀疏任务奖励只放在 action chunk 的最后一个有效 latent step，由 semi-Markov GAE 反向传播信用。
+- 连续 Gaussian 的 entropy penalty 使用逐维、截断为非负的 differential entropy，避免负 entropy 反向成为奖励。
 - Entropy 和 smoothness 只进入 composite reward 一次，不重复加入 loss。
 - PPO replay 与 rollout 都使用 eval mode，首次 likelihood ratio 不受 dropout 扰动。
+- PPO 使用提交前 target-KL 回溯和 epoch early stop；异常的首次 on-policy KL 会直接中止而不是静默训练。
 - Exit gate 使用跨多个 rollout 的紧凑校准缓冲区。
 - Checkpoint 原子写入并支持 BC、warmup、PPO 和 gate calibration 的真实断点续训。
 - 评测必须完成准确的 500 episodes；异常或缺失 shard 不会被当作成功。
@@ -463,7 +455,7 @@ CHECKPOINT_COMPLETE.json
   ...其余参数保持与原 run 一致
 ```
 
-推荐使用正式 launcher；它会自动验证当前 manifest/schema、恢复兼容 checkpoint，并归档动作 PPO 或推理语义不兼容的旧 run。不要通过手工复制部分 `.pt` 文件绕过原子 manifest。
+推荐使用正式 launcher；它会自动验证当前 manifest/schema、恢复兼容 checkpoint，并归档 PPO 或推理语义不兼容的旧 run。不要通过手工复制部分 `.pt` 文件绕过原子 manifest。
 
 ## 评测结果
 

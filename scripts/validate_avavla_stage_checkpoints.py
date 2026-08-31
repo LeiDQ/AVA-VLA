@@ -55,7 +55,7 @@ def state_digests(
         if not torch.is_tensor(value):
             continue
         tensor = value.detach().cpu().contiguous()
-        raw = tensor.view(torch.uint8).numpy().tobytes()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
         descriptor = f"{key}\0{tensor.dtype}\0{tuple(tensor.shape)}\0".encode()
         for name, selector in selectors.items():
             if selector(key):

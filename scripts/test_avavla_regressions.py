@@ -221,6 +221,90 @@ def test_mixed_precision_ppo_replay() -> None:
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+class _ConstantExit(nn.Module):
+    def forward(self, states):
+        return states.new_zeros(states.shape[0], 1)
+
+
+def test_fp32_on_policy_ratio_contract() -> None:
+    """An unchanged policy must replay its own rollout at ratio=1 and KL=0."""
+    torch.manual_seed(17)
+    latent_dim, obs_dim, update_dim = 8, 8, 4
+    policy = ReasoningPolicy(
+        latent_dim=latent_dim,
+        obs_dim=obs_dim,
+        hidden_dim=16,
+        update_dim=update_dim,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+    ).eval()
+    transition = LatentTransition(
+        latent_dim=latent_dim,
+        obs_dim=obs_dim,
+        hidden_dim=16,
+        update_dim=update_dim,
+        num_heads=2,
+        num_obs_tokens=2,
+        dropout=0.0,
+    ).eval()
+    value = ValueFunction(latent_dim=latent_dim, hidden_dim=16, dropout=0.0).eval()
+    dummy = SimpleNamespace(
+        enable_latent_reasoning=True,
+        max_reasoning_steps=3,
+        exit_threshold=0.5,
+        update_dim=update_dim,
+        reasoning_policy=policy,
+        latent_transition=transition,
+        exit_gate=_ConstantExit(),
+        value_function=value,
+    )
+    _, _, trajectory = AVAVLA.latent_reasoning_forward(
+        dummy,
+        torch.randn(5, latent_dim).to(torch.bfloat16),
+        torch.randn(5, obs_dim).to(torch.bfloat16),
+        training=True,
+        return_trajectory=True,
+    )
+    assert trajectory["latent_states"].dtype == torch.float32
+    trajectory["ppo_advantages"] = torch.ones(5, 3)
+    trajectory["ppo_returns"] = torch.zeros(5, 3)
+    trajectory["ppo_step_rewards"] = torch.zeros(5, 3)
+    loss, metrics = AVAVLA.compute_rl_loss(
+        dummy,
+        trajectory,
+        torch.zeros(5),
+        recompute_policy=True,
+        recompute_dynamics=False,
+        recompute_observation=False,
+    )
+    assert torch.isfinite(loss)
+    assert abs(metrics["ppo_ratio_mean"] - 1.0) < 1e-6
+    assert metrics["ppo_clip_fraction"] == 0.0
+    assert metrics["ppo_approx_kl"] < 1e-7
+
+
+def test_continuous_uncertainty_penalty_cannot_reward_collapse() -> None:
+    policy = ReasoningPolicy(
+        latent_dim=4,
+        obs_dim=4,
+        hidden_dim=8,
+        update_dim=3,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+    )
+    mean = torch.zeros(2, 3)
+    collapsed = {"mean": mean, "log_std": torch.full_like(mean, -5.0)}
+    collapsed["std"] = collapsed["log_std"].exp()
+    unit = {"mean": mean, "log_std": torch.zeros_like(mean)}
+    unit["std"] = unit["log_std"].exp()
+    collapsed_penalty = policy.uncertainty_penalty(collapsed)
+    unit_penalty = policy.uncertainty_penalty(unit)
+    assert torch.equal(collapsed_penalty, torch.zeros_like(collapsed_penalty))
+    assert torch.all(unit_penalty > 0)
+
+
 class _PPOGradientModel(nn.Module):
     """Small real-module graph used to prove PPO gradients reach the observation path."""
 
@@ -461,6 +545,8 @@ def main() -> int:
         test_dynamic_early_exit,
         test_sparse_task_reward_is_not_repeated,
         test_mixed_precision_ppo_replay,
+        test_fp32_on_policy_ratio_contract,
+        test_continuous_uncertainty_penalty_cannot_reward_collapse,
         test_ppo_observation_recompute_gradient_contract,
         test_regularizers_are_not_double_counted,
         test_proprio_mask_and_center_crop,

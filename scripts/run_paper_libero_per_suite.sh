@@ -38,6 +38,7 @@ PYTHON="$ROOT/.venv/bin/python"
 EVAL_SHARDS="${EVAL_SHARDS:-8}"
 SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-2048}"
 BC_SAVE_FREQ="${BC_SAVE_FREQ:-1000}"
+BC_BOOTSTRAP_CHECKPOINT="${BC_BOOTSTRAP_CHECKPOINT:-}"
 
 for integer_setting in EVAL_SHARDS SHUFFLE_BUFFER_SIZE BC_SAVE_FREQ; do
     integer_value="${!integer_setting}"
@@ -103,6 +104,13 @@ try:
         raise SystemExit(1)
     if int(manifest.get("implementation_version", 0)) < 9:
         raise SystemExit(1)
+    stage = str(manifest.get("stage", ""))
+    if stage not in {"bc", "bc_complete"}:
+        rl = config.get("rl", {})
+        if rl.get("latent_ppo_state_contract") != "fixed_fp32_rollout_states_v1":
+            raise SystemExit(1)
+        if rl.get("ppo_update_contract") != "post_step_kl_backtracking_v1":
+            raise SystemExit(1)
     required = manifest.get("required_files", {})
     if not isinstance(required, dict) or not required:
         raise SystemExit(1)
@@ -111,6 +119,21 @@ try:
         if not artifact.is_file() or artifact.stat().st_size != int(expected_size):
             raise SystemExit(1)
 except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+is_bc_bootstrap() {
+    is_safe_run "$1" || return 1
+    "$PYTHON" - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+with (root / "CHECKPOINT_COMPLETE.json").open() as stream:
+    manifest = json.load(stream)
+if str(manifest.get("stage", "")) != "bc_complete":
     raise SystemExit(1)
 PY
 }
@@ -198,7 +221,12 @@ datasets=(
 )
 suites=(libero_spatial libero_object libero_goal libero_10)
 
-status "pipeline_start paper=2606.15099 policies=per_suite seeds=[$PAPER_SEEDS] vision_profile=${VISION_BACKBONE_PROFILE:-openvla-224} shuffle_buffer_per_rank=$SHUFFLE_BUFFER_SIZE bc_save_freq=$BC_SAVE_FREQ"
+if [[ -n "$BC_BOOTSTRAP_CHECKPOINT" ]] && ! is_bc_bootstrap "$BC_BOOTSTRAP_CHECKPOINT"; then
+    status "blocked_invalid_bc_bootstrap path=$BC_BOOTSTRAP_CHECKPOINT"
+    exit 2
+fi
+
+status "pipeline_start paper=2606.15099 policies=per_suite seeds=[$PAPER_SEEDS] vision_profile=${VISION_BACKBONE_PROFILE:-openvla-224} shuffle_buffer_per_rank=$SHUFFLE_BUFFER_SIZE bc_save_freq=$BC_SAVE_FREQ bc_bootstrap=${BC_BOOTSTRAP_CHECKPOINT:-none}"
 for seed in $PAPER_SEEDS; do
     for index in "${!datasets[@]}"; do
         dataset="${datasets[$index]}"
@@ -244,6 +272,12 @@ for seed in $PAPER_SEEDS; do
             resume_args=(--vla_path "$BASE_MODEL")
             if [[ -f "$run_dir/CHECKPOINT_COMPLETE.json" ]] && is_safe_run "$run_dir"; then
                 resume_args=(--vla_path "$run_dir" --resume true)
+            elif [[ -n "$BC_BOOTSTRAP_CHECKPOINT" ]]; then
+                resume_args=(
+                    --vla_path "$BC_BOOTSTRAP_CHECKPOINT"
+                    --resume true
+                    --override_resume_training_config true
+                )
             fi
             status "training_start suite=$suite dataset=$dataset seed=$seed resume=${resume_args[*]}"
             "$ROOT/.venv/bin/torchrun" --standalone --nproc-per-node=8 \
@@ -282,7 +316,9 @@ for seed in $PAPER_SEEDS; do
                 --entropy_coef 0.01 \
                 --smoothness_coef 0.1 \
                 --action_ppo_std 0.05 \
-                --action_ppo_coef 1.0 \
+                --action_ppo_coef 0.0 \
+                --ppo_target_kl 0.02 \
+                --ppo_max_backtracks 12 \
                 --max_grad_norm 1.0 \
                 --max_reasoning_steps 5 \
                 --exit_threshold 0.55 \

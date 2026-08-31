@@ -260,11 +260,11 @@ def query_online_policy_batch(
     image_transform,
     unnorm_key: Optional[str],
     center_crop: bool = True,
-    action_policy_std: float = 0.05,
+    action_policy_std: float = 0.0,
 ) -> tuple[np.ndarray, Dict[str, torch.Tensor], np.ndarray]:
     """Query one online batch and retain replayable multimodal PPO features."""
-    if action_policy_std <= 0:
-        raise ValueError("action_policy_std must be positive for on-policy action PPO")
+    if action_policy_std < 0:
+        raise ValueError("action_policy_std must be non-negative")
     model = avavla.module if hasattr(avavla, "module") else avavla
     device = model.device
     unnorm_keys = _resolve_unnorm_keys(observations, unnorm_key)
@@ -350,14 +350,21 @@ def query_online_policy_batch(
     # actions. PPO adds exploration in that same space, without a saturating
     # clamp/atanh/tanh transform.
     robot_action_means = action_head(action_features.to(action_dtype)).float()
-    action_distribution = torch.distributions.Normal(
-        robot_action_means,
-        torch.full_like(robot_action_means, float(action_policy_std)),
-    )
-    robot_action_samples = action_distribution.sample()
-    old_robot_action_log_probs = action_distribution.log_prob(
-        robot_action_samples
-    ).sum(dim=(-1, -2))
+    if action_policy_std > 0:
+        action_distribution = torch.distributions.Normal(
+            robot_action_means,
+            torch.full_like(robot_action_means, float(action_policy_std)),
+        )
+        robot_action_samples = action_distribution.sample()
+        old_robot_action_log_probs = action_distribution.log_prob(
+            robot_action_samples
+        ).sum(dim=(-1, -2))
+    else:
+        # Section 3.5 applies PPO to latent reasoning actions.  Keep the
+        # frozen/supervised OFT action policy deterministic unless the optional
+        # action-space PPO ablation is explicitly enabled.
+        robot_action_samples = robot_action_means
+        old_robot_action_log_probs = robot_action_means.new_zeros(robot_action_means.shape[0])
     actions = _unnormalize_action_batch(
         model,
         robot_action_samples.cpu().numpy(),
@@ -436,7 +443,7 @@ def collect_online_rollout(
     unnorm_key: Optional[str],
     rollout_size: int,
     center_crop: bool = True,
-    action_policy_std: float = 0.05,
+    action_policy_std: float = 0.0,
 ) -> tuple[Dict[str, torch.Tensor], int, Dict[str, float]]:
     """Collect exactly rollout_size local policy queries using true environment outcomes."""
     num_envs = len(collector.slots)

@@ -86,7 +86,7 @@ with (root / "CHECKPOINT_COMPLETE.json").open() as stream:
 with (root / "TRAINING_COMPLETE").open() as stream:
     complete = json.load(stream)
 if int(manifest.get("implementation_version", 0)) < 9:
-    raise SystemExit("checkpoint schema is incompatible with the current action-PPO contract")
+    raise SystemExit("checkpoint schema is incompatible with the current PPO contract")
 for relative_name, expected_size in manifest.get("required_files", {}).items():
     path = root / relative_name
     if not path.is_file() or path.stat().st_size != int(expected_size):
@@ -104,10 +104,10 @@ required = {
     "latent_warmup": {"latent_warmup_loss", "latent_distance_mean"},
     "online_ppo": {
         "policy_loss", "value_loss", "smoothness_loss", "total_rl_loss",
-        "robot_action_policy_loss", "joint_ppo_loss", "ppo_observation_recomputed",
-        "ppo_joint_action_update", "ppo_action_path_recomputed", "ppo_bc_action_loss",
-        "ppo_projector_grad_norm", "ppo_latent_to_llm_grad_norm",
-        "ppo_action_head_grad_norm", "robot_action_mean_out_of_bounds_fraction",
+        "joint_ppo_loss", "ppo_ratio_mean", "ppo_clip_fraction", "ppo_approx_kl",
+        "ppo_global_max_kl", "ppo_early_stop_kl", "ppo_optimizer_minibatches",
+        "ppo_pre_update_approx_kl", "ppo_trust_region_scale", "ppo_trust_region_backtracks",
+        "robot_action_ppo_enabled", "ppo_bc_action_loss",
     },
     "exit_calibration": {"exit_calibration_loss", "exit_calibration_accuracy"},
 }
@@ -123,6 +123,11 @@ for row in rows:
     if any(not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in values):
         raise SystemExit(f"stage {stage} contains a non-finite metric")
     seen.add(stage)
+    if stage == "online_ppo":
+        if float(metrics["ppo_global_max_kl"]) > 0.030001:
+            raise SystemExit(f"PPO trust region was violated: {metrics['ppo_global_max_kl']}")
+        if float(metrics["ppo_trust_region_scale"]) <= 0.0:
+            raise SystemExit("PPO candidate update could not be accepted")
 if seen != set(required):
     raise SystemExit(f"missing smoke stages: {sorted(set(required) - seen)}")
 stage_counts = Counter(row["stage"] for row in rows)
@@ -199,7 +204,9 @@ while true; do
         --entropy_coef 0.01 \
         --smoothness_coef 0.1 \
         --action_ppo_std 0.05 \
-        --action_ppo_coef 1.0 \
+        --action_ppo_coef 0.0 \
+        --ppo_target_kl 0.02 \
+        --ppo_max_backtracks 12 \
         --max_grad_norm 1.0 \
         --max_reasoning_steps 5 \
         --exit_threshold 0.55 \

@@ -168,6 +168,23 @@ class ReasoningPolicy(nn.Module):
             )
         return torch.distributions.Categorical(probs=policy_output["probs"])
 
+    def uncertainty_penalty(self, policy_output: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return a non-negative uncertainty measure for the composite reward.
+
+        Differential entropy of a continuous Gaussian becomes negative as its
+        variance shrinks.  Subtracting that raw value from reward would then
+        *reward* variance collapse.  The paper uses entropy to penalize
+        excessive uncertainty, so for the continuous policy we average the
+        positive per-dimension differential entropy.  Categorical entropy is
+        already non-negative and needs no adjustment.
+        """
+        if "mean" in policy_output:
+            per_dimension = torch.distributions.Normal(
+                policy_output["mean"], policy_output["std"]
+            ).entropy()
+            return per_dimension.clamp_min(0.0).mean(dim=-1)
+        return torch.distributions.Categorical(probs=policy_output["probs"]).entropy()
+
     def sample_update_action(
         self,
         policy_output: Dict[str, torch.Tensor],
@@ -186,7 +203,7 @@ class ReasoningPolicy(nn.Module):
             dist = self._distribution(policy_output)
             update_action = dist.rsample() if training else policy_output["mean"]
             log_prob = dist.log_prob(update_action)
-            entropy = dist.entropy()
+            entropy = self.uncertainty_penalty(policy_output)
             return update_action, log_prob, entropy
 
         logits, probs = policy_output["logits"], policy_output["probs"]
@@ -209,7 +226,7 @@ class ReasoningPolicy(nn.Module):
         """Return log probability and entropy for PPO updates on stored update actions."""
         if "mean" in policy_output:
             dist = self._distribution(policy_output)
-            return dist.log_prob(update_action), dist.entropy()
+            return dist.log_prob(update_action), self.uncertainty_penalty(policy_output)
 
         log_probs = F.log_softmax(policy_output["logits"], dim=-1)
         probs = policy_output["probs"]
@@ -726,7 +743,14 @@ class AVAVLA(OpenVLA):
             }
 
         batch_size = z_t.shape[0]
-        current_z = z_t
+        # The latent policy, transition, critic and exit gate are small FP32
+        # modules.  Run the complete recurrent latent stream in their native
+        # dtype even when the surrounding VLA encoder is under BF16 autocast.
+        # This gives rollout collection and PPO replay the same numerical
+        # contract and prevents five recurrent log-prob errors from compounding.
+        latent_dtype = _floating_parameter_dtype(self.reasoning_policy, z_t.dtype)
+        current_z = z_t.to(dtype=latent_dtype)
+        obs_encoding = obs_encoding.to(dtype=latent_dtype)
         final_z = current_z
         active = torch.ones(batch_size, dtype=torch.bool, device=z_t.device)
         steps_per_sample = torch.zeros(batch_size, dtype=torch.long, device=z_t.device)
@@ -750,17 +774,14 @@ class AVAVLA(OpenVLA):
                 break
             z_before_active = current_z.index_select(0, active_indices)
             obs_active = obs_encoding.index_select(0, active_indices)
-            policy_output = self.reasoning_policy(z_before_active, obs_active)
-            u_active, log_prob_active, entropy_active = self.reasoning_policy.sample_update_action(
-                policy_output,
-                training=training,
-            )
-            z_next_active = self.latent_transition(z_before_active, obs_active, u_active)
-            e_active = self.exit_gate(z_next_active).squeeze(-1)
-            # CUDA autocast can keep the latent stream in BF16 while GRU and
-            # normalization kernels return FP32.  Preserve a stable latent
-            # dtype across recurrent steps; keep policy statistics in their
-            # native (usually FP32) dtype for PPO numerical accuracy.
+            with torch.autocast(device_type=z_t.device.type, enabled=False):
+                policy_output = self.reasoning_policy(z_before_active, obs_active)
+                u_active, log_prob_active, entropy_active = self.reasoning_policy.sample_update_action(
+                    policy_output,
+                    training=training,
+                )
+                z_next_active = self.latent_transition(z_before_active, obs_active, u_active)
+                e_active = self.exit_gate(z_next_active).squeeze(-1)
             z_next_active = z_next_active.to(dtype=current_z.dtype)
 
             z_before = current_z
@@ -999,6 +1020,8 @@ class AVAVLA(OpenVLA):
             advantages = (advantages - advantage_mean) / advantage_var.sqrt()
 
         ratio = torch.exp((log_probs - old_log_probs).clamp(-20.0, 20.0))
+        log_ratio = log_probs - old_log_probs
+        approx_kl = ((((ratio - 1.0) - log_ratio) * valid_mask).sum() / denom).clamp_min(0.0)
         unclipped_policy = ratio * advantages.detach()
         clipped_policy = torch.clamp(ratio, 1.0 - ppo_clip_ratio, 1.0 + ppo_clip_ratio) * advantages.detach()
         policy_loss = -((torch.minimum(unclipped_policy, clipped_policy) * valid_mask).sum() / denom)
@@ -1043,6 +1066,7 @@ class AVAVLA(OpenVLA):
             "entropy_penalty": float(entropy_penalty.detach().cpu()),
             "smoothness_loss": float(smoothness_loss.detach().cpu()),
             "ppo_ratio_mean": float(((ratio * valid_mask).sum() / denom).detach().cpu()),
+            "ppo_approx_kl": float(approx_kl.detach().cpu()),
             "ppo_clip_fraction": float(
                 ((((ratio - 1.0).abs() > ppo_clip_ratio).to(dtype=valid_mask.dtype) * valid_mask).sum() / denom)
                 .detach()
