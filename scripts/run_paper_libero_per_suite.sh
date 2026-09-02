@@ -38,7 +38,6 @@ PYTHON="$ROOT/.venv/bin/python"
 EVAL_SHARDS="${EVAL_SHARDS:-8}"
 SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-2048}"
 BC_SAVE_FREQ="${BC_SAVE_FREQ:-1000}"
-BC_BOOTSTRAP_CHECKPOINT="${BC_BOOTSTRAP_CHECKPOINT:-}"
 
 for integer_setting in EVAL_SHARDS SHUFFLE_BUFFER_SIZE BC_SAVE_FREQ; do
     integer_value="${!integer_setting}"
@@ -119,21 +118,6 @@ try:
         if not artifact.is_file() or artifact.stat().st_size != int(expected_size):
             raise SystemExit(1)
 except (OSError, TypeError, ValueError, json.JSONDecodeError):
-    raise SystemExit(1)
-PY
-}
-
-is_bc_bootstrap() {
-    is_safe_run "$1" || return 1
-    "$PYTHON" - "$1" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-with (root / "CHECKPOINT_COMPLETE.json").open() as stream:
-    manifest = json.load(stream)
-if str(manifest.get("stage", "")) != "bc_complete":
     raise SystemExit(1)
 PY
 }
@@ -221,12 +205,7 @@ datasets=(
 )
 suites=(libero_spatial libero_object libero_goal libero_10)
 
-if [[ -n "$BC_BOOTSTRAP_CHECKPOINT" ]] && ! is_bc_bootstrap "$BC_BOOTSTRAP_CHECKPOINT"; then
-    status "blocked_invalid_bc_bootstrap path=$BC_BOOTSTRAP_CHECKPOINT"
-    exit 2
-fi
-
-status "pipeline_start paper=2606.15099 policies=per_suite seeds=[$PAPER_SEEDS] vision_profile=${VISION_BACKBONE_PROFILE:-openvla-224} shuffle_buffer_per_rank=$SHUFFLE_BUFFER_SIZE bc_save_freq=$BC_SAVE_FREQ bc_bootstrap=${BC_BOOTSTRAP_CHECKPOINT:-none}"
+status "pipeline_start paper=2606.15099 policies=per_suite seeds=[$PAPER_SEEDS] vision_profile=${VISION_BACKBONE_PROFILE:-openvla-224} shuffle_buffer_per_rank=$SHUFFLE_BUFFER_SIZE bc_save_freq=$BC_SAVE_FREQ"
 for seed in $PAPER_SEEDS; do
     for index in "${!datasets[@]}"; do
         dataset="${datasets[$index]}"
@@ -246,43 +225,16 @@ for seed in $PAPER_SEEDS; do
             sleep 300
         done
 
-        if [[ -d "$run_dir" && ! -f "$run_dir/CHECKPOINT_COMPLETE.json" && ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
-            archive="$RUN_ROOT/invalid_uncheckpointed/${run_id}.$(date -u +%Y%m%dT%H%M%SZ)"
-            mkdir -p "$(dirname "$archive")"
-            mv "$run_dir" "$archive"
-            status "archived_uncheckpointed_run run=$run_id archive=$archive reason=no_atomic_manifest"
-        elif [[ -d "$run_dir" ]] && ! is_safe_run "$run_dir"; then
-            archive="$RUN_ROOT/invalid_incompatible/${run_id}.$(date -u +%Y%m%dT%H%M%SZ)"
-            mkdir -p "$(dirname "$archive")"
-            mv "$run_dir" "$archive"
-            status "archived_invalid_checkpoint run=$run_id archive=$archive reason=incompatible_checkpoint_contract"
+        if [[ -d "$run_dir" && ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
+            status "blocked_existing_run suite=$suite seed=$seed path=$run_dir"
+            exit 3
         fi
 
-        while true; do
-            if [[ -f "$run_dir/TRAINING_COMPLETE" ]] && is_safe_run "$run_dir"; then
-                break
-            fi
-            if [[ -d "$run_dir" ]] && ! is_safe_run "$run_dir"; then
-                archive="$RUN_ROOT/invalid_retry/${run_id}.$(date -u +%Y%m%dT%H%M%S%N)"
-                mkdir -p "$(dirname "$archive")"
-                mv "$run_dir" "$archive"
-                status "archived_invalid_retry run=$run_id archive=$archive reason=missing_or_incompatible_manifest"
-            fi
-
-            resume_args=(--vla_path "$BASE_MODEL")
-            if [[ -f "$run_dir/CHECKPOINT_COMPLETE.json" ]] && is_safe_run "$run_dir"; then
-                resume_args=(--vla_path "$run_dir" --resume true)
-            elif [[ -n "$BC_BOOTSTRAP_CHECKPOINT" ]]; then
-                resume_args=(
-                    --vla_path "$BC_BOOTSTRAP_CHECKPOINT"
-                    --resume true
-                    --override_resume_training_config true
-                )
-            fi
-            status "training_start suite=$suite dataset=$dataset seed=$seed resume=${resume_args[*]}"
+        if [[ ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
+            status "training_start suite=$suite dataset=$dataset seed=$seed"
             "$ROOT/.venv/bin/torchrun" --standalone --nproc-per-node=8 \
                 "$ROOT/vla-scripts/finetune_avavla.py" \
-                "${resume_args[@]}" \
+                --vla_path "$BASE_MODEL" \
                 --llm_config_path "$TOKENIZER" \
                 --data_root_dir "$DATA_ROOT" \
                 --dataset_name "$dataset" \
@@ -336,15 +288,11 @@ for seed in $PAPER_SEEDS; do
             rc=$?
             if [[ -f "$run_dir/TRAINING_COMPLETE" ]] && is_safe_run "$run_dir"; then
                 status "training_complete suite=$suite seed=$seed run=$run_id"
-                break
+            else
+                status "training_failed suite=$suite seed=$seed exit_code=$rc"
+                exit 4
             fi
-            if [[ -d "$run_dir" ]] && ! is_safe_run "$run_dir"; then
-                status "training_invalid_checkpoint suite=$suite seed=$seed exit_code=$rc retry=immediate"
-                continue
-            fi
-            status "training_retry suite=$suite seed=$seed exit_code=$rc delay_seconds=60"
-            sleep 60
-        done
+        fi
 
         if ! "$PYTHON" "$ROOT/scripts/validate_avavla_stage_checkpoints.py" \
             "$run_dir" --write-report >>"$train_log" 2>&1; then

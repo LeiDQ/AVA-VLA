@@ -111,11 +111,8 @@ for seed in $PAPER_SEEDS; do
     run_id="paper_all_suites_seed${seed}"
     run_dir="$RUN_ROOT/$run_id"
     train_log="$LOG_ROOT/${run_id}.train.log"
-    resume_args=(--vla_path "$BASE_MODEL")
-    if [[ -f "$run_dir/CHECKPOINT_COMPLETE.json" && ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
-        resume_args=(--vla_path "$run_dir" --resume true)
-    elif [[ -d "$run_dir" && ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
-        status "blocked_unsafe_partial_run run=$run_id path=$run_dir"
+    if [[ -d "$run_dir" && ! -f "$run_dir/TRAINING_COMPLETE" ]]; then
+        status "blocked_existing_run run=$run_id path=$run_dir"
         exit 3
     fi
 
@@ -123,7 +120,7 @@ for seed in $PAPER_SEEDS; do
         status "training_start policy=all_four_suites seed=$seed dataset=$DATASET"
         "$ROOT/.venv/bin/torchrun" --standalone --nproc-per-node=8 \
             "$ROOT/vla-scripts/finetune_avavla.py" \
-            "${resume_args[@]}" \
+            --vla_path "$BASE_MODEL" \
             --llm_config_path "$TOKENIZER" \
             --data_root_dir "$DATA_ROOT" \
             --dataset_name "$DATASET" \

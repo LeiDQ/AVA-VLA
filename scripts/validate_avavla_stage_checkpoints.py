@@ -96,8 +96,8 @@ def validate_archive(archive: Path, schedule: Dict) -> Dict:
     stage = archive.name
     if manifest.get("stage") != stage or stage_metadata.get("stage") != stage:
         raise RuntimeError(f"Stage identity mismatch in {archive}")
-    if not stage_metadata.get("independently_resumable"):
-        raise RuntimeError(f"Archive is not marked independently resumable: {archive}")
+    if not stage_metadata.get("independently_loadable"):
+        raise RuntimeError(f"Archive is not marked independently loadable: {archive}")
     for relative_name, expected_size in manifest.get("required_files", {}).items():
         artifact = archive / relative_name
         actual_size = artifact.stat().st_size if artifact.is_file() else -1

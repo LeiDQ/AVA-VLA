@@ -157,10 +157,7 @@ class RLDSDataset(IterableDataset):
             mixture_spec = [(self.data_mix, 1.0)]
 
         # fmt: off
-        if "aloha" in self.data_mix:
-            load_camera_views = ("primary", "left_wrist", "right_wrist")
-        else:
-            load_camera_views = ("primary", "wrist")
+        load_camera_views = ("primary", "wrist")
 
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,

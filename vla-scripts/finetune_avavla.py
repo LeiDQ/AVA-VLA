@@ -76,7 +76,7 @@ class AVAVLAFinetuneConfig:
     
     # Dataset
     data_root_dir: Path = Path("datasets/rlds")
-    dataset_name: str = "aloha_scoop_x_into_bowl"
+    dataset_name: str = "libero_spatial_no_noops"
     run_root_dir: Path = Path("runs_avavla")
     shuffle_buffer_size: int = 2_048
     seed: int = 0
@@ -169,11 +169,6 @@ class AVAVLAFinetuneConfig:
     ppo_checkpoint_interval_updates: int = 10
     exit_checkpoint_interval_steps: int = 1_000
     save_latest_checkpoint_only: bool = False
-    resume: bool = False
-    resume_step: Optional[int] = None
-    # Use only architecture/weights/stage state from a completed BC checkpoint
-    # while taking the new training contract from CLI/defaults.
-    override_resume_training_config: bool = False
     image_aug: bool = True
     history_window_size: int = NUM_ACTIONS_CHUNK + 1
     
@@ -193,10 +188,6 @@ def get_run_id(cfg) -> str:
     """Generates an identifier string for an experiment run."""
     if cfg.run_id_override is not None:
         run_id = cfg.run_id_override
-    elif cfg.resume:
-        run_id = cfg.vla_path.split("/")[-1]
-        if "chkpt" in run_id.split("--")[-1]:
-            run_id = "--".join(run_id.split("--")[:-1])
     else:
         run_id = (
             f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
@@ -235,7 +226,7 @@ def resolve_paper_training_budget(cfg: AVAVLAFinetuneConfig, world_size: int) ->
     if cfg.shuffle_buffer_size <= 0:
         raise ValueError("shuffle_buffer_size must be positive.")
     if cfg.save_freq <= 0:
-        raise ValueError("save_freq must be positive so resumable checkpoints are produced.")
+        raise ValueError("save_freq must be positive so periodic checkpoints are produced.")
     if cfg.ppo_checkpoint_interval_updates <= 0:
         raise ValueError("ppo_checkpoint_interval_updates must be positive.")
     if cfg.exit_checkpoint_interval_steps <= 0:
@@ -1285,75 +1276,16 @@ def make_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
     }
 
 
-def _checkpoint_sort_key(path: Path) -> Tuple[int, object]:
-    """Sort component checkpoints by numeric step when present, otherwise by mtime/name."""
-    suffix = path.name.split("--", 1)[-1].split("_checkpoint.pt", 1)[0]
-    if suffix.isdigit():
-        return (0, int(suffix))
-    try:
-        return (1, path.stat().st_mtime)
-    except OSError:
-        return (1, path.name)
-
-
-def _find_component_checkpoint(run_dir: Path, stem: str, step: Optional[int] = None) -> Optional[Path]:
-    """Find a latest or step-specific component checkpoint."""
-    manifest_path = run_dir / "CHECKPOINT_COMPLETE.json"
-    if manifest_path.is_file():
-        try:
-            with manifest_path.open("r", encoding="utf-8") as stream:
-                manifest = json.load(stream)
-            manifest_step = int(manifest.get("log_step", -1))
-            if step is None or int(step) == manifest_step:
-                matches = [
-                    run_dir / relative_name
-                    for relative_name in manifest.get("required_files", {})
-                    if Path(relative_name).name.startswith(f"{stem}--")
-                ]
-                if len(matches) == 1 and matches[0].is_file():
-                    return matches[0]
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-
-    if step is None:
-        latest = run_dir / f"{stem}--latest_checkpoint.pt"
-        if latest.exists():
-            return latest
-        candidates = sorted(run_dir.glob(f"{stem}--*_checkpoint.pt"), key=_checkpoint_sort_key)
-    else:
-        candidates = sorted(run_dir.glob(f"{stem}--{step}_checkpoint.pt"), key=_checkpoint_sort_key)
-        if not candidates:
-            candidates = sorted(run_dir.glob(f"{stem}--*{step}*_checkpoint.pt"), key=_checkpoint_sort_key)
-        if not candidates:
-            latest = run_dir / f"{stem}--latest_checkpoint.pt"
-            manifest_path = run_dir / "CHECKPOINT_COMPLETE.json"
-            if latest.exists() and manifest_path.exists():
-                try:
-                    with manifest_path.open("r", encoding="utf-8") as stream:
-                        manifest_step = int(json.load(stream).get("log_step", -1))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                    manifest_step = -1
-                if manifest_step == int(step):
-                    candidates = [latest]
-
-    return candidates[-1] if candidates else None
-
-
-def _select_prismatic_checkpoint(run_dir: Path, resume_step: Optional[int] = None) -> Path:
+def _select_prismatic_checkpoint(run_dir: Path) -> Path:
     """Resolve a Prismatic checkpoint file from a run directory or checkpoint file path."""
     if run_dir.is_file():
         return run_dir
 
     checkpoint_dir = run_dir / "checkpoints"
-    if resume_step is None:
-        latest = checkpoint_dir / "latest-checkpoint.pt"
-        if latest.exists():
-            return latest
-        candidates = sorted(checkpoint_dir.glob("*.pt"))
-    else:
-        candidates = sorted(checkpoint_dir.glob(f"*step-{resume_step:06d}*.pt"))
-        if not candidates:
-            candidates = sorted(checkpoint_dir.glob(f"*{resume_step}*.pt"))
+    latest = checkpoint_dir / "latest-checkpoint.pt"
+    if latest.exists():
+        return latest
+    candidates = sorted(checkpoint_dir.glob("*.pt"))
 
     if not candidates:
         raise FileNotFoundError(f"No Prismatic checkpoint found under {checkpoint_dir}")
@@ -1452,7 +1384,7 @@ def _atomic_write_json(payload: Dict, path: Path) -> None:
 
 
 def _copy_if_different(source: Path, destination: Path) -> None:
-    """Atomically copy metadata while allowing resume-in-place without SameFileError."""
+    """Atomically copy metadata without raising SameFileError."""
     source, destination = Path(source), Path(destination)
     if source.resolve() == destination.resolve():
         return
@@ -1485,7 +1417,7 @@ def _link_or_copy_base_checkpoint(source: Path, destination: Path) -> None:
 
 
 def _validate_completed_stage_metadata(cfg, manifest: Dict, paper_state: Dict) -> Dict[str, bool]:
-    """Validate counters that make a completed-stage checkpoint safe to resume."""
+    """Validate counters before publishing a completed-stage checkpoint."""
     stage = str(manifest.get("stage", ""))
     if stage not in COMPLETED_STAGE_NAMES:
         return {}
@@ -1544,8 +1476,7 @@ def _archive_completed_stage_checkpoint(
 ) -> Optional[Path]:
     """Keep an independently loadable snapshot for every completed paper stage.
 
-    The main run directory remains the resumable latest checkpoint.  Files in the
-    completed generation are hard-linked into a stage-specific directory when
+    Files in the completed generation are hard-linked into a stage-specific directory when
     possible, so later rotation can unlink the main-directory names without
     deleting boundary weights or duplicating the immutable base checkpoint.
     """
@@ -1587,7 +1518,7 @@ def _archive_completed_stage_checkpoint(
             {
                 "stage": stage,
                 "log_step": int(manifest["log_step"]),
-                "independently_resumable": True,
+                "independently_loadable": True,
                 "boundary_checks": dict(boundary_checks or {}),
                 "source_checkpoint_dir": str(checkpoint_dir.resolve()),
             },
@@ -1599,68 +1530,6 @@ def _archive_completed_stage_checkpoint(
         if temporary_dir.exists():
             shutil.rmtree(temporary_dir)
     return archive_dir
-
-
-def _inherit_completed_stage_checkpoint(source_dir: Path, run_dir: Path, stage: str) -> Path:
-    """Register an external completed-stage checkpoint in a branched run.
-
-    Branching Stage 2 from a preserved BC boundary must retain the complete
-    four-stage provenance inside the new run.  Files are hard-linked when the
-    source and destination share a filesystem, so the 30 GB immutable base
-    checkpoint is not duplicated.
-    """
-    source_dir = Path(source_dir)
-    source_manifest = _validate_checkpoint_manifest(source_dir)
-    if str(source_manifest.get("stage", "")) != stage:
-        raise RuntimeError(
-            f"Cannot inherit stage={stage} from {source_dir}: "
-            f"manifest stage={source_manifest.get('stage')}"
-        )
-    source_metadata = source_dir / "STAGE_CHECKPOINT.json"
-    if not source_metadata.is_file():
-        raise RuntimeError(f"Inherited stage checkpoint has no metadata: {source_metadata}")
-
-    destination = Path(run_dir) / "stage_checkpoints" / stage
-    if destination.is_dir():
-        destination_manifest = _validate_checkpoint_manifest(destination)
-        if (
-            destination_manifest.get("stage") == stage
-            and int(destination_manifest.get("log_step", -1))
-            == int(source_manifest.get("log_step", -2))
-        ):
-            return destination
-        raise RuntimeError(f"Refusing to replace incompatible inherited stage: {destination}")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    temporary.mkdir(parents=True)
-    try:
-        for relative_name, expected_size in source_manifest["required_files"].items():
-            source = source_dir / relative_name
-            if not source.is_file() or source.stat().st_size != int(expected_size):
-                raise RuntimeError(f"Inherited stage artifact is incomplete: {source}")
-            _link_or_copy_base_checkpoint(source, temporary / relative_name)
-        _atomic_write_json(source_manifest, temporary / "CHECKPOINT_COMPLETE.json")
-        _link_or_copy_base_checkpoint(source_metadata, temporary / "STAGE_CHECKPOINT.json")
-        _validate_checkpoint_manifest(temporary)
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
-    return destination
-
-
-def _restore_stage_artifact_for_resume(cfg, run_dir: Path, artifact_name: str) -> Path:
-    """Materialize a stage-local artifact when resuming from an archived checkpoint."""
-    destination = Path(run_dir) / artifact_name
-    if destination.is_file() or not cfg.resume:
-        return destination
-    source = _component_root(Path(cfg.vla_path)) / artifact_name
-    if source.is_file():
-        _link_or_copy_base_checkpoint(source, destination)
-    return destination
 
 
 def _validate_checkpoint_manifest(root: Path) -> Dict:
@@ -1689,105 +1558,6 @@ def _validate_checkpoint_manifest(root: Path) -> Dict:
     return manifest
 
 
-def apply_saved_avavla_config(cfg: AVAVLAFinetuneConfig) -> Dict:
-    """Load saved AVA hyperparameters during resume so architecture and action path match the checkpoint."""
-    if not cfg.resume:
-        return {}
-
-    component_root = _component_root(Path(cfg.vla_path))
-    config_path = component_root / "avavla_config.json"
-    if not config_path.exists():
-        raise RuntimeError(f"Resume requested but no avavla_config.json was found at {config_path}")
-
-    with open(config_path, "r") as f:
-        saved_cfg = json.load(f)
-    if int(saved_cfg.get("implementation_version", 0)) < CHECKPOINT_IMPLEMENTATION_VERSION:
-        raise RuntimeError(
-            "This checkpoint predates the end-to-end OpenVLA-OFT action-PPO and direct-action parameterization contract and cannot be resumed safely. "
-            "Start a new run from the OpenVLA Prismatic base checkpoint."
-        )
-    manifest = _validate_checkpoint_manifest(component_root)
-    saved_rl = saved_cfg.get("rl", {})
-    saved_contract = saved_rl.get("latent_ppo_state_contract")
-    saved_update_contract = saved_rl.get("ppo_update_contract")
-    checkpoint_stage = str(manifest.get("stage", ""))
-    if (
-        saved_contract != "fixed_fp32_rollout_states_v1"
-        and checkpoint_stage not in {"bc", "bc_complete"}
-    ):
-        raise RuntimeError(
-            "This checkpoint predates the stable latent-PPO objective contract. "
-            "Restart Stage 2 from the preserved bc_complete checkpoint instead of resuming it."
-        )
-    if (
-        saved_update_contract != "post_step_kl_backtracking_v1"
-        and checkpoint_stage not in {"bc", "bc_complete"}
-    ):
-        raise RuntimeError(
-            "This checkpoint predates transactional PPO trust-region updates. "
-            "Restart Stage 2 from the preserved bc_complete checkpoint instead of resuming it."
-        )
-    if cfg.override_resume_training_config and checkpoint_stage not in {
-        "bc",
-        "bc_complete",
-    }:
-        raise RuntimeError(
-            "override_resume_training_config is only allowed when branching from a BC checkpoint."
-        )
-
-    top_level_fields = (
-        "use_l1_regression",
-        "latent_dim",
-        "obs_dim",
-        "update_dim",
-        "reasoning_policy_type",
-        "reasoning_hidden_dim",
-        "reasoning_num_heads",
-        "reasoning_num_layers",
-        "transition_hidden_dim",
-        "exit_gate_hidden_dim",
-        "value_hidden_dim",
-        "action_hidden_dim",
-        "dropout",
-        "max_reasoning_steps",
-        "exit_threshold",
-        "enable_latent_reasoning",
-        "history_window_size",
-        "proprio_dim",
-        "use_wrist_image",
-        "use_proprio",
-        "require_384px_backbone",
-        "require_dinosiglip_backbone",
-        "require_robot_pretrained_base",
-    )
-    for field_name in top_level_fields:
-        if field_name in saved_cfg:
-            setattr(cfg, field_name, saved_cfg[field_name])
-
-    if not cfg.override_resume_training_config:
-        for field_name, value in saved_cfg.get("rl", {}).items():
-            if hasattr(cfg, field_name):
-                setattr(cfg, field_name, value)
-        for field_name, value in saved_cfg.get("paper_schedule", {}).items():
-            if hasattr(cfg, field_name):
-                setattr(cfg, field_name, value)
-
-        optimizer_field_aliases = {
-            "beta1": "adam_beta1",
-            "beta2": "adam_beta2",
-            "eps": "adam_eps",
-        }
-        for field_name, value in saved_cfg.get("optimizer", {}).items():
-            config_field = optimizer_field_aliases.get(field_name, field_name)
-            if field_name != "name" and hasattr(cfg, config_field):
-                setattr(cfg, config_field, value)
-    else:
-        print("Branching from BC weights with the current CLI training contract")
-
-    print(f"Loaded AVA hyperparameters from {config_path}")
-    return saved_cfg
-
-
 def build_avavla_from_prismatic_checkpoint(cfg: AVAVLAFinetuneConfig, device_id: int):
     """Instantiate AVAVLA from a local Prismatic/OpenVLA checkpoint layout."""
     vla_path = Path(cfg.vla_path)
@@ -1797,12 +1567,7 @@ def build_avavla_from_prismatic_checkpoint(cfg: AVAVLAFinetuneConfig, device_id:
             "Paper reproduction must start from the robot-pretrained OpenVLA Prismatic checkpoint "
             "(openvla/openvla-7b-prismatic), not a generic Prism/LLaVA checkpoint."
         )
-    # AVA checkpoint directories keep the reconstructed base VLA at a stable
-    # latest-checkpoint path. resume_step selects compact AVA/training state,
-    # not a nonexistent step-named copy of the 30 GB base checkpoint.
-    is_avavla_checkpoint = (_component_root(vla_path) / "avavla_config.json").exists()
-    base_step = None if is_avavla_checkpoint else (cfg.resume_step if cfg.resume else None)
-    checkpoint_path = _select_prismatic_checkpoint(vla_path, base_step)
+    checkpoint_path = _select_prismatic_checkpoint(vla_path)
 
     vision_backbone, image_transform = get_vision_backbone_and_transform(
         model_cfg["vision_backbone_id"],
@@ -1877,80 +1642,6 @@ def save_base_prismatic_checkpoint(avavla: AVAVLA, checkpoint_path: Path) -> Non
         },
         checkpoint_path,
     )
-
-
-def resolve_checkpoint_map_location(device_id) -> torch.device:
-    """Return a torch.load-compatible device for a local distributed rank."""
-    if isinstance(device_id, torch.device):
-        return device_id
-    if isinstance(device_id, int):
-        return torch.device("cuda", device_id) if torch.cuda.is_available() else torch.device("cpu")
-    return torch.device(device_id)
-
-
-def load_resume_state(
-    cfg: AVAVLAFinetuneConfig,
-    avavla,
-    action_head,
-    optimizer,
-    scheduler,
-    device_id: int,
-) -> Dict:
-    """Load AVA-VLA/action/optimizer/scheduler state from an AVA checkpoint directory."""
-    if not cfg.resume:
-        return {"log_step": 0}
-
-    root = _component_root(Path(cfg.vla_path))
-    _validate_checkpoint_manifest(root)
-    step = cfg.resume_step
-    map_location = resolve_checkpoint_map_location(device_id)
-
-    avavla_state_path = _find_component_checkpoint(root, "avavla", step)
-    if avavla_state_path is not None:
-        avavla.module.load_avavla_state_dict(torch.load(avavla_state_path, map_location=map_location), strict=True)
-        print(f"Resumed AVA-VLA components from {avavla_state_path}")
-    else:
-        raise RuntimeError(
-            f"Missing complete AVA-VLA component checkpoint under {root}; refusing random initialization."
-        )
-
-    if action_head is not None:
-        action_head_path = _find_component_checkpoint(root, "action_head", step)
-        if action_head_path is not None:
-            action_head.module.load_state_dict(torch.load(action_head_path, map_location=map_location))
-            print(f"Resumed action head from {action_head_path}")
-        else:
-            raise RuntimeError(f"Missing L1 action-head checkpoint under {root}")
-
-    training_state_path = _find_component_checkpoint(root, "training_state", step)
-    if training_state_path is None:
-        raise RuntimeError(f"Missing optimizer/scheduler training state under {root}")
-
-    training_state = torch.load(training_state_path, map_location=map_location)
-    if int(training_state.get("implementation_version", 0)) < CHECKPOINT_IMPLEMENTATION_VERSION:
-        raise RuntimeError(
-            f"Training state {training_state_path} is incompatible with the current checkpoint schema"
-        )
-    if optimizer is not None and scheduler is not None:
-        optimizer.load_state_dict(training_state["optimizer"])
-        scheduler.load_state_dict(training_state["scheduler"])
-        print(f"Resumed optimizer/scheduler from {training_state_path}")
-    else:
-        print(f"Resumed model state at log step {training_state.get('log_step', step or 0)}")
-    training_state["log_step"] = int(training_state.get("log_step", step or 0))
-
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    rng_state_path = _find_component_checkpoint(root, f"rng_state_rank{rank}", step)
-    if rng_state_path is None:
-        raise RuntimeError(f"Missing RNG state for rank {rank} under {root}")
-    rng_state = torch.load(rng_state_path, map_location="cpu")
-    random.setstate(rng_state["python"])
-    np.random.set_state(rng_state["numpy"])
-    torch.set_rng_state(rng_state["torch_cpu"])
-    if torch.cuda.is_available() and rng_state.get("torch_cuda") is not None:
-        torch.cuda.set_rng_state(rng_state["torch_cuda"], device=device_id)
-    print(f"Restored RNG state for rank {rank} from {rng_state_path}")
-    return training_state
 
 
 def run_forward_pass_with_latent_reasoning(
@@ -2196,7 +1887,7 @@ def save_training_checkpoint(
         if stage_name == "online_ppo_complete":
             # Stage 4 trains from compact PPO trajectories rather than fresh
             # environment interaction.  Include every rank's buffer so this
-            # boundary is independently resumable, not merely evaluable.
+            # completed-stage artifact remains self-contained.
             required_paths.extend(
                 checkpoint_dir / f"exit_calibration_buffer_rank{rank_index}.pt"
                 for rank_index in range(int(distributed_state.num_processes))
@@ -2308,124 +1999,10 @@ def execute_paper_training(
     distributed_state,
     device_id,
     num_patches,
-    resume_state,
     val_dataloader=None,
 ) -> None:
     """Execute BC, latent warmup, true online PPO, then exit calibration."""
-    log_step = int(resume_state.get("log_step", 0)) if cfg.resume else 0
-    if cfg.resume:
-        # A process may have logged unsaved work after the last atomic
-        # checkpoint. Remove that tail before appending so global_step remains
-        # unique and continuous after recovery.
-        distributed_barrier()
-        if distributed_state.is_main_process:
-            metrics_path = run_dir / "metrics.jsonl"
-            if metrics_path.exists():
-                kept_rows = []
-                with metrics_path.open("r", encoding="utf-8") as stream:
-                    for line in stream:
-                        try:
-                            row = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if int(row.get("global_step", -1)) <= log_step:
-                            kept_rows.append(json.dumps(row, sort_keys=True))
-                temporary_path = metrics_path.with_name(f".{metrics_path.name}.tmp-{os.getpid()}")
-                temporary_path.write_text("\n".join(kept_rows) + ("\n" if kept_rows else ""), encoding="utf-8")
-                os.replace(temporary_path, metrics_path)
-        distributed_barrier()
-    stage_state_path = run_dir / "paper_stage_state.json"
-    checkpoint_paper_state = resume_state.get("paper_state") if cfg.resume else None
-    if checkpoint_paper_state:
-        # This state was serialized in the same torch.save call as the model and
-        # optimizer, so its counters cannot run ahead of the restored weights.
-        saved_stage_state = dict(checkpoint_paper_state)
-    elif cfg.resume and stage_state_path.exists():
-        with stage_state_path.open("r", encoding="utf-8") as stream:
-            candidate_stage_state = json.load(stream)
-        if int(candidate_stage_state.get("log_step", -1)) <= log_step:
-            saved_stage_state = candidate_stage_state
-        else:
-            saved_stage_state = {"stage": "bc", "log_step": log_step}
-    else:
-        saved_stage_state = {"stage": "bc", "log_step": log_step}
-    resume_stage = saved_stage_state.get("stage", "bc")
-
-    stage_order = {
-        "bc": 0,
-        "bc_complete": 1,
-        "latent_warmup": 1,
-        "latent_warmup_complete": 2,
-        "online_ppo": 2,
-        "online_ppo_complete": 3,
-        "exit_calibration": 3,
-        "complete": 4,
-    }
-    if resume_stage not in stage_order:
-        raise ValueError(f"Unknown resume stage: {resume_stage}")
-    resume_rank = stage_order[resume_stage]
-
-    if cfg.resume and resume_stage == "bc_complete":
-        source_stage = _component_root(Path(cfg.vla_path))
-        if source_stage.resolve() != Path(run_dir).resolve():
-            distributed_barrier()
-            if distributed_state.is_main_process:
-                inherited = _inherit_completed_stage_checkpoint(
-                    source_stage,
-                    Path(run_dir),
-                    "bc_complete",
-                )
-                print(f"Inherited completed BC checkpoint at {inherited}", flush=True)
-            distributed_barrier()
-
-    if resume_stage == "complete":
-        distributed_barrier()
-        if distributed_state.is_main_process:
-            complete_payload = {
-                "dataset": cfg.dataset_name,
-                "log_step": log_step,
-                "ppo_environment_steps": int(
-                    saved_stage_state.get("global_env_steps", cfg.ppo_environment_steps)
-                ),
-                "exit_threshold": cfg.exit_threshold,
-                "checkpoint_dir": str(run_dir),
-            }
-            (run_dir / "TRAINING_COMPLETE").write_text(
-                json.dumps(complete_payload, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        distributed_barrier()
-        return
-
-    def restore_optimizer_for_stage(stage: str, optimizer, scheduler) -> None:
-        if not cfg.resume or resume_stage != stage:
-            return
-        if "optimizer" not in resume_state or "scheduler" not in resume_state:
-            return
-        optimizer.load_state_dict(resume_state["optimizer"])
-        scheduler.load_state_dict(resume_state["scheduler"])
-        for state in optimizer.state.values():
-            for key, value in state.items():
-                if torch.is_tensor(value):
-                    state[key] = value.to(device_id)
-        print(f"Restored {stage} optimizer/scheduler at global step {log_step}")
-
-    def last_logged_metrics(stage: str, max_global_step: Optional[int] = None) -> Dict[str, float]:
-        metrics_path = run_dir / "metrics.jsonl"
-        if not metrics_path.exists():
-            return {}
-        latest = {}
-        with metrics_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("stage") == stage and (
-                    max_global_step is None or int(row.get("global_step", -1)) <= max_global_step
-                ):
-                    latest = row.get("metrics", {})
-        return latest
+    log_step = 0
     data_iterator = iter(dataloader)
 
     def next_demo_batch():
@@ -2568,16 +2145,10 @@ def execute_paper_training(
     ) as progress:
         # Stage 1: behavior cloning. Latent reasoning is deliberately bypassed.
         optimizer, scheduler, trainable_params = build_stage_optimizer(avavla, action_head, "bc", cfg)
-        restore_optimizer_for_stage("bc", optimizer, scheduler)
         avavla.train()
         if action_head is not None:
             action_head.train()
-        bc_start = (
-            int(saved_stage_state.get("stage_step", min(log_step, cfg.bc_steps)))
-            if resume_stage == "bc"
-            else cfg.bc_steps
-        )
-        bc_start = max(0, min(cfg.bc_steps, bc_start))
+        bc_start = 0
         for stage_step in range(bc_start, cfg.bc_steps):
             optimizer.zero_grad(set_to_none=True)
             metric_rows = []
@@ -2624,21 +2195,10 @@ def execute_paper_training(
         optimizer, scheduler, trainable_params = build_stage_optimizer(
             avavla, action_head, "latent_warmup", cfg
         )
-        restore_optimizer_for_stage("latent_warmup", optimizer, scheduler)
         avavla.train()
         if action_head is not None:
             action_head.eval()
-        warmup_start = (
-            int(
-                saved_stage_state.get(
-                    "stage_step",
-                    max(0, min(cfg.latent_warmup_steps, log_step - cfg.bc_steps)),
-                )
-            )
-            if resume_stage == "latent_warmup"
-            else (cfg.latent_warmup_steps if resume_rank > 1 else 0)
-        )
-        warmup_start = max(0, min(cfg.latent_warmup_steps, warmup_start))
+        warmup_start = 0
         for stage_step in range(warmup_start, cfg.latent_warmup_steps):
             optimizer.zero_grad(set_to_none=True)
             action_alignment_loss, action_metrics, reasoning_info = run_forward_pass_with_latent_reasoning(
@@ -2717,53 +2277,15 @@ def execute_paper_training(
                     f"libero_task_suites={cfg.libero_task_suites!r}."
                 )
         optimizer, scheduler, trainable_params = build_stage_optimizer(avavla, action_head, "ppo", cfg)
-        restore_optimizer_for_stage("online_ppo", optimizer, scheduler)
-        online_resume_metrics = last_logged_metrics("online_ppo", max_global_step=log_step)
-        if resume_stage == "online_ppo":
-            global_env_steps = int(
-                saved_stage_state.get(
-                    "global_env_steps",
-                    online_resume_metrics.get("global_env_steps", 0),
-                )
-            )
-            ppo_update = int(
-                saved_stage_state.get(
-                    "ppo_update",
-                    online_resume_metrics.get("ppo_update", 0),
-                )
-            )
-        elif resume_rank > 2:
-            global_env_steps = int(
-                saved_stage_state.get(
-                    "global_env_steps",
-                    online_resume_metrics.get("global_env_steps", cfg.ppo_environment_steps),
-                )
-            )
-            ppo_update = int(
-                saved_stage_state.get(
-                    "ppo_update",
-                    online_resume_metrics.get("ppo_update", cfg.ppo_optimizer_steps or 0),
-                )
-            )
-        else:
-            global_env_steps = 0
-            ppo_update = 0
+        global_env_steps = 0
+        ppo_update = 0
 
         last_rollout = None
         calibration_rollouts = deque(maxlen=max(1, cfg.exit_calibration_buffer_rollouts))
-        calibration_buffer_path = _restore_stage_artifact_for_resume(
-            cfg,
-            run_dir,
-            f"exit_calibration_buffer_rank{distributed_state.process_index}.pt",
+        calibration_buffer_path = (
+            Path(run_dir)
+            / f"exit_calibration_buffer_rank{distributed_state.process_index}.pt"
         )
-        if cfg.resume and calibration_buffer_path.exists():
-            saved_rollouts = torch.load(
-                calibration_buffer_path,
-                map_location=resolve_checkpoint_map_location(device_id),
-            )
-            calibration_rollouts.extend(saved_rollouts)
-            if calibration_rollouts:
-                last_rollout = calibration_rollouts[-1]
 
         def save_calibration_buffer() -> None:
             if not calibration_rollouts:
@@ -2772,7 +2294,7 @@ def execute_paper_training(
             torch.save(list(calibration_rollouts), temporary_path)
             os.replace(temporary_path, calibration_buffer_path)
 
-        if resume_rank <= 2:
+        if cfg.online_ppo:
             if is_calvin:
                 collector = CalvinVectorRollout(
                     dataset_root=cfg.data_root_dir,
@@ -2889,8 +2411,7 @@ def execute_paper_training(
                     )
                     if ppo_checkpoint_due:
                         # Persist rollout data before any checkpoint whose stage
-                        # counters depend on it, preventing an unrecoverable
-                        # exit-calibration resume point.
+                        # counters depend on it, keeping stage artifacts complete.
                         save_calibration_buffer()
                     save_checkpoint(
                         "online_ppo",
@@ -2904,7 +2425,7 @@ def execute_paper_training(
             finally:
                 collector.close()
             if last_rollout is None:
-                raise RuntimeError("Online PPO completed without a recoverable rollout buffer.")
+                raise RuntimeError("Online PPO completed without an exit-calibration rollout buffer.")
             save_checkpoint(
                 "online_ppo_complete",
                 optimizer,
@@ -2914,23 +2435,16 @@ def execute_paper_training(
                 ppo_update=ppo_update,
             )
 
-        if not calibration_rollouts and resume_rank <= 3:
+        if not calibration_rollouts:
             raise RuntimeError(
-                f"Missing exit-calibration rollout buffer at {calibration_buffer_path}; "
-                "resume the online_ppo checkpoint that precedes exit calibration."
+                f"Missing exit-calibration rollout buffer at {calibration_buffer_path}."
             )
 
         # Stage 4: freeze everything except g_omega and calibrate from critic value of computation.
         optimizer, scheduler, trainable_params = build_stage_optimizer(
             avavla, action_head, "exit_calibration", cfg
         )
-        restore_optimizer_for_stage("exit_calibration", optimizer, scheduler)
-        exit_start = (
-            int(saved_stage_state.get("stage_step", 0))
-            if resume_stage == "exit_calibration"
-            else (cfg.exit_calibration_steps if resume_rank > 3 else 0)
-        )
-        exit_start = max(0, min(cfg.exit_calibration_steps, exit_start))
+        exit_start = 0
         for stage_step in range(exit_start, cfg.exit_calibration_steps):
             calibration_rollout = calibration_rollouts[
                 random.randrange(len(calibration_rollouts))
@@ -3007,7 +2521,6 @@ def execute_paper_training(
 def finetune_avavla(cfg: AVAVLAFinetuneConfig) -> None:
     """Fine-tunes AVA-VLA on demonstration dataset."""
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    apply_saved_avavla_config(cfg)
     print(f"Fine-tuning AVA-VLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
     
     run_id = get_run_id(cfg)
@@ -3076,7 +2589,6 @@ def finetune_avavla(cfg: AVAVLAFinetuneConfig) -> None:
     
     optimizer, scheduler, trainable_params = build_stage_optimizer(avavla, action_head, "bc", cfg)
     print(f"# BC trainable params: {sum(p.numel() for p in trainable_params)}")
-    resume_state = load_resume_state(cfg, avavla, action_head, None, None, device_id)
     
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
@@ -3173,7 +2685,6 @@ def finetune_avavla(cfg: AVAVLAFinetuneConfig) -> None:
         distributed_state=distributed_state,
         device_id=device_id,
         num_patches=num_patches,
-        resume_state=resume_state,
         val_dataloader=val_dataloader,
     )
     return

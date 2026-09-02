@@ -2,9 +2,9 @@
 
 Official implementation of **AVA-VLA: Think Less, Act Early**.
 
-[Paper](https://arxiv.org/abs/2606.15099) · [Detailed implementation notes](IMPLEMENTATION_REPRODUCTION_NOTES.md) · [LIBERO setup](LIBERO.md) · [General setup](SETUP.md)
+[Paper](https://arxiv.org/abs/2606.15099) · [LIBERO setup](LIBERO.md) · [General setup](SETUP.md)
 
-AVA-VLA adds reinforced latent reasoning and dynamic early exit to an OpenVLA/OpenVLA-OFT policy. This repository provides the four-stage training pipeline, distributed online rollouts, checkpoint recovery, benchmark evaluation, and result aggregation.
+AVA-VLA adds reinforced latent reasoning and dynamic early exit to an OpenVLA/OpenVLA-OFT policy. This repository provides the four-stage training pipeline, distributed online rollouts, benchmark evaluation, and result aggregation.
 
 ## Installation
 
@@ -134,47 +134,12 @@ A small interface-test subset can be downloaded without retrieving the full data
 
 ## Training protocol
 
-AVA-VLA training consists of four consecutive stages:
+Before AVA-VLA training, prepare the 384px robot-pretrained VLA base by applying the OpenVLA robot-demonstration training procedure to a compatible 384px VLM. AVA-VLA training then consists of four consecutive stages:
 
 1. Behavior cloning on robot demonstrations.
 2. Latent reasoning warmup.
 3. Joint online PPO with benchmark task rewards.
 4. Exit-gate calibration.
-
-The default full training configuration is:
-
-| Setting | Value |
-|---|---:|
-| GPUs | 8 |
-| Training seeds | 0, 1, 2 |
-| BC steps | 100,000 |
-| Global BC batch size | 64 |
-| Per-rank RLDS shuffle buffer | 2,048 examples |
-| BC checkpoint interval | 1,000 steps |
-| Latent warmup steps | 50,000 |
-| PPO environment steps | 1,200,000 |
-| PPO effective batch size | 512 |
-| PPO minibatch size | 64 |
-| PPO epochs | 4 |
-| Policy learning rate | 3e-5 |
-| Critic learning rate | 1e-4 |
-| PPO clip ratio | 0.2 |
-| GAE lambda | 0.95 |
-| Entropy coefficient | 0.01 |
-| Smoothness coefficient | 0.1 |
-| Action PPO exploration std | 0.05 in normalized action space |
-| Action chunk length | 8 |
-| Observation history window | 9 frames |
-| Maximum reasoning steps | 5 |
-| Exit threshold | 0.55 |
-| Exit calibration steps | 10,000 |
-| Exit lookahead | 3 |
-| Exit delta | 0.05 |
-| Gradient clipping | 1.0 |
-
-Training, online rollout, and deterministic evaluation derive image resolution and transforms from
-the selected robot-pretrained VLA checkpoint and share the same proprioception statistics, action
-normalization, action chunking, and history convention.
 
 ## LIBERO training and evaluation
 
@@ -294,72 +259,6 @@ bash scripts/run_table1_all_suites_short.sh
 
 These tests validate execution, distributed communication, online environment interaction, metrics, and checkpoint structure. Benchmark results should be reported only from the full training and evaluation budgets above.
 
-## Monitoring and outputs
-
-Monitor a per-suite run with:
-
-```bash
-tail -f logs/paper_reproduction/status.log
-tail -f logs/paper_reproduction/libero_spatial.seed0.train.log
-watch -n 2 nvidia-smi
-```
-
-The launcher writes `pipeline.pid` automatically. Start 30-second GPU, process, filesystem, and
-host-memory telemetry with:
-
-```bash
-nohup bash scripts/record_paper_telemetry.sh \
-  >>logs/paper_reproduction/telemetry.log 2>&1 </dev/null &
-```
-
-The CSV outputs are `gpu_telemetry.csv`, `process_telemetry.csv`, and
-`host_memory_telemetry.csv` under the selected log directory. Set `LOG_ROOT` when monitoring an
-all-suite run with a custom log directory.
-
-Training metrics are written as JSON Lines:
-
-```text
-runs/paper_per_suite/paper_<suite>_seed<seed>/metrics.jsonl
-```
-
-Generate loss plots and CSV data with:
-
-```bash
-./.venv/bin/python scripts/plot_avavla_losses.py \
-  runs/paper_per_suite/paper_spatial_seed0/metrics.jsonl \
-  --output-dir results/paper_per_suite/libero_spatial/seed0/training_curves
-```
-
-Main result files:
-
-```text
-results/paper_per_suite/<suite>/seed<seed>/evaluation_results.json
-results/paper_per_suite/table1_ours_per_suite.json
-results/paper_all_suites/table1_ours_all_policy.json
-```
-
-LIBERO evaluation uses 10 tasks, 50 trials per task, center crop, proprioception normalization, latent history, and an open-loop action chunk of 8.
-
-## Checkpoint recovery
-
-Each resumable checkpoint contains a `CHECKPOINT_COMPLETE.json` manifest. The manifest records all required components and their byte sizes so interrupted or partially copied checkpoints are not resumed as complete runs.
-
-BC checkpoints are written every 1,000 steps. PPO checkpoints are written every 10 updates and at the environment-step boundary. Exit calibration checkpoints are written every 1,000 steps. The latest checkpoint remains the automatic interruption-recovery point.
-
-The completed BC, latent-warmup, online-PPO, and final exit-calibration states are also retained under `stage_checkpoints/`. These archives use hard links when the filesystem permits, validate their stage counters, and remain independently loadable after later checkpoints rotate. The completed online-PPO archive includes the per-rank calibration buffers required to continue directly into exit calibration. At the end of training, the launcher writes a cross-stage validation report to `stage_checkpoints/STAGE_VALIDATION.json`; it verifies the checkpoint manifests and the stage-specific parameter-freezing contracts.
-
-`SHUFFLE_BUFFER_SIZE` and `BC_SAVE_FREQ` may be overridden for a different host-memory or storage profile.
-
-For a manual distributed resume, keep all experiment arguments identical to the original run:
-
-```bash
-./.venv/bin/torchrun --standalone --nproc-per-node=8 \
-  vla-scripts/finetune_avavla.py \
-  --vla_path runs/paper_per_suite/paper_spatial_seed0 \
-  --resume true \
-  ...
-```
-
 ## Repository structure
 
 ```text
@@ -373,8 +272,6 @@ experiments/robot/calvin/online_rollout.py   CALVIN online collector
 experiments/robot/calvin/run_calvin_eval.py  CALVIN sequence evaluation
 scripts/aggregate_table1_ours.py             LIBERO result aggregation
 ```
-
-Architecture details, PPO data flow, normalization contracts, checkpoint schema, and extended debugging instructions are documented in [IMPLEMENTATION_REPRODUCTION_NOTES.md](IMPLEMENTATION_REPRODUCTION_NOTES.md).
 
 ## Citation
 

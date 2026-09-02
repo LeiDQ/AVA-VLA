@@ -40,15 +40,15 @@ export OMP_NUM_THREADS=8
 RUN_ID="paper_calvin_abc_seed${SEED}"
 RUN_DIR="$RUN_ROOT/$RUN_ID"
 TRAIN_LOG="$LOG_ROOT/${RUN_ID}.train.log"
-resume_args=(--vla_path "$BASE_MODEL")
-if [[ -f "$RUN_DIR/CHECKPOINT_COMPLETE.json" ]]; then
-    resume_args=(--vla_path "$RUN_DIR" --resume true)
+if [[ -d "$RUN_DIR" && ! -f "$RUN_DIR/TRAINING_COMPLETE" ]]; then
+    echo "Refusing to reuse an incomplete run directory: $RUN_DIR" >&2
+    exit 4
 fi
 
 if [[ ! -f "$RUN_DIR/TRAINING_COMPLETE" ]]; then
     "$ROOT/.venv/bin/torchrun" --standalone --nproc-per-node=8 \
         "$ROOT/vla-scripts/finetune_avavla.py" \
-        "${resume_args[@]}" \
+        --vla_path "$BASE_MODEL" \
         --llm_config_path "$TOKENIZER" \
         --data_root_dir "$DATA_ROOT" \
         --dataset_name calvin_abc \

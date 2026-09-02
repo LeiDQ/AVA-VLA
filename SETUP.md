@@ -41,12 +41,6 @@ pip install -e third_party/LIBERO
 pip install -r experiments/robot/libero/libero_requirements.txt
 ```
 
-For ALOHA robot evaluation:
-
-```bash
-pip install -r experiments/robot/aloha/requirements_aloha.txt
-```
-
 ## Local Paths
 
 Keep machine-specific data, checkpoint, and run paths outside the repository and pass them explicitly:

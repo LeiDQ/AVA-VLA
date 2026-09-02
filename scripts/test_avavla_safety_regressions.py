@@ -239,12 +239,7 @@ def test_robot_action_ppo_gradient_contract() -> None:
     assert torch.isfinite(loss)
 
 
-def test_atomic_checkpoint_and_resume_step_contract() -> None:
-    expected_device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
-    assert FINETUNE.resolve_checkpoint_map_location(3) == expected_device
-    assert FINETUNE.resolve_checkpoint_map_location("cpu") == torch.device("cpu")
-    assert FINETUNE.resolve_checkpoint_map_location(torch.device("cpu")) == torch.device("cpu")
-
+def test_atomic_checkpoint_contract() -> None:
     with tempfile.TemporaryDirectory() as temporary_directory:
         root = Path(temporary_directory)
         artifact = root / "training_state--step-17-bc_checkpoint.pt"
@@ -265,8 +260,6 @@ def test_atomic_checkpoint_and_resume_step_contract() -> None:
         FINETUNE._atomic_write_json(manifest, root / "CHECKPOINT_COMPLETE.json")
         loaded = FINETUNE._validate_checkpoint_manifest(root)
         assert loaded["log_step"] == 17
-        assert FINETUNE._find_component_checkpoint(root, "training_state", 17) == artifact
-        assert FINETUNE._find_component_checkpoint(root, "training_state") == artifact
         assert DEPLOY._find_component_checkpoint(root, "training_state") == artifact
         assert "projector" in FINETUNE.AVAVLA.AVA_PARAMETER_PREFIXES
 
@@ -308,7 +301,7 @@ def test_bc_complete_archive_survives_latest_rotation() -> None:
         assert archive == root / "stage_checkpoints" / "bc_complete"
         archived_manifest = FINETUNE._validate_checkpoint_manifest(archive)
         assert archived_manifest["stage"] == "bc_complete"
-        assert json.loads((archive / "STAGE_CHECKPOINT.json").read_text())["independently_resumable"]
+        assert json.loads((archive / "STAGE_CHECKPOINT.json").read_text())["independently_loadable"]
 
         archived_action = archive / "action_head--step-100000-bc_complete_checkpoint.pt"
         assert archived_action.stat().st_ino == (
@@ -403,7 +396,7 @@ def main() -> int:
         test_semimarkov_chunk_discount,
         test_stage3_joint_trainability,
         test_robot_action_ppo_gradient_contract,
-        test_atomic_checkpoint_and_resume_step_contract,
+        test_atomic_checkpoint_contract,
         test_bc_complete_archive_survives_latest_rotation,
         test_deployment_rejects_incomplete_or_legacy_checkpoint,
         test_paper_schedule_requires_latent_reasoning,

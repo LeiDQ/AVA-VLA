@@ -72,7 +72,7 @@ class FinetuneConfig:
 
     # Dataset
     data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
-    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
+    dataset_name: str = "libero_spatial_no_noops"    # Name of the RLDS fine-tuning dataset
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
@@ -97,8 +97,6 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = False                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -120,31 +118,6 @@ class FinetuneConfig:
     # fmt: on
 
 
-def remove_ddp_in_checkpoint(state_dict) -> dict:
-    """
-    Removes the 'module.' prefix from parameter names in a PyTorch model state dictionary that was saved using
-    DistributedDataParallel (DDP).
-
-    When a model is trained using PyTorch's DistributedDataParallel, the saved state dictionary contains parameters
-    prefixed with 'module.'. This function removes these prefixes to make the state dictionary compatible when
-    loading into models that are not yet wrapped in DDP.
-
-    Args:
-        state_dict (dict): PyTorch model state dictionary.
-
-    Returns:
-        dict: A new state dictionary with the same contents but with 'module.' prefixes removed from parameter names.
-              Parameters without the 'module.' prefix remain unchanged.
-    """
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k[:7] == "module.":
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
-    return new_state_dict
-
-
 def get_run_id(cfg) -> str:
     """
     Generates or retrieves an identifier string for an experiment run.
@@ -158,12 +131,6 @@ def get_run_id(cfg) -> str:
     if cfg.run_id_override is not None:
         # Override the run ID with the user-provided ID
         run_id = cfg.run_id_override
-    elif cfg.resume:
-        # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
-        # Remove the "--XXX_chkpt" suffix from the run ID if it exists
-        if "chkpt" in run_id.split("--")[-1]:
-            run_id = "--".join(run_id.split("--")[:-1])
     else:
         run_id = (
             f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
@@ -177,25 +144,6 @@ def get_run_id(cfg) -> str:
         if cfg.run_id_note is not None:
             run_id += f"--{cfg.run_id_note}"
     return run_id
-
-
-def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
-    """
-    Loads a checkpoint for a given module.
-
-    Args:
-        module_name (str): Name of model component to load checkpoint for.
-        path (str): Path to checkpoint directory.
-        step (int): Gradient step number of saved checkpoint.
-        device (str): String specifying how to remap storage locations (default = "cpu").
-
-    Returns:
-        dict: PyTorch model state dictionary.
-    """
-    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
-    print(f"Loading checkpoint: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
-    return remove_ddp_in_checkpoint(state_dict)
 
 
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
@@ -238,7 +186,7 @@ def init_module(
     find_unused_params: bool = False,
 ) -> DDP:
     """
-    Initializes a module, optionally loads checkpoint, moves to device, and wraps with DDP.
+    Initializes a module, moves it to the selected device, and wraps it with DDP.
 
     Args:
         module_class (Type[nn.Module]): Class of PyTorch module to initialize.
@@ -254,10 +202,6 @@ def init_module(
     """
     module = module_class(**module_args)
     count_parameters(module, module_name)
-
-    if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
-        module.load_state_dict(state_dict)
 
     if to_bf16:
         module = module.to(torch.bfloat16)
@@ -866,9 +810,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             llm_dim=vla.llm_dim,
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
-        if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
-            vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
     # Wrap VLA with DDP
@@ -1070,7 +1011,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            log_step = gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 

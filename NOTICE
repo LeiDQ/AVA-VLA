@@ -20,7 +20,7 @@ License notice:
   Copyright (c) 2025 Moo Jin Kim, Chelsea Finn, Percy Liang.
 
 Additional third-party projects used by the training and evaluation workflows
-include LIBERO, ALOHA, Hugging Face Transformers/Hub, PyTorch, TensorFlow,
+include LIBERO, CALVIN, Hugging Face Transformers/Hub, PyTorch, TensorFlow,
 TensorFlow Datasets, RLDS-related tooling, PEFT, Diffusers, and related robot
 learning dependencies. Those projects are governed by their own licenses.
 

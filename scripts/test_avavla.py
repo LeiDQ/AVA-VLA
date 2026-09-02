@@ -290,7 +290,6 @@ def test_file_structure():
         "vla-scripts/deploy_avavla.py",
         "scripts/evaluate_avavla.py",
         "README.md",
-        "IMPLEMENTATION_REPRODUCTION_NOTES.md",
     ]
     
     all_exist = True
